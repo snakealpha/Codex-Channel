@@ -95,7 +95,18 @@ impl CodexCli {
         F: FnMut(CodexStreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let mut child = command.spawn().context("failed to spawn codex process")?;
+        let launcher = self.config.launcher.join(" ");
+        let working_directory = command
+            .as_std()
+            .get_current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn codex process (launcher: `{launcher}`, working_directory: `{working_directory}`)"
+            )
+        })?;
 
         if let Some(prompt) = prompt {
             if let Some(mut stdin) = child.stdin.take() {

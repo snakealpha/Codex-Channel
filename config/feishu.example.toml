@@ -2,8 +2,8 @@ state_file = ".codex-channel/sessions.json"
 
 [adapter]
 type = "feishu"
-app_id_env = "FEISHU_APP_ID"
-app_secret_env = "FEISHU_APP_SECRET"
+app_id = "FEISHU_APP_ID"
+app_secret = "FEISHU_APP_SECRET"
 base_url = "https://open.feishu.cn"
 reconnect_interval_secs = 5
 

@@ -60,10 +60,6 @@ pub struct FeishuAdapterConfig {
     pub app_id: Option<String>,
     #[serde(default)]
     pub app_secret: Option<String>,
-    #[serde(default)]
-    pub app_id_env: Option<String>,
-    #[serde(default)]
-    pub app_secret_env: Option<String>,
     #[serde(default = "default_feishu_base_url")]
     pub base_url: String,
     #[serde(default = "default_feishu_reconnect_seconds")]

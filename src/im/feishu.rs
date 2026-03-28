@@ -44,8 +44,8 @@ pub struct FeishuAdapter {
 
 impl FeishuAdapter {
     pub fn new(config: FeishuAdapterConfig) -> Result<Self> {
-        let app_id = resolve_secret("app_id", config.app_id, config.app_id_env)?;
-        let app_secret = resolve_secret("app_secret", config.app_secret, config.app_secret_env)?;
+        let app_id = resolve_secret_env("app_id", config.app_id)?;
+        let app_secret = resolve_secret_env("app_secret", config.app_secret)?;
 
         Ok(Self {
             app_id,
@@ -537,27 +537,21 @@ impl ImAdapter for FeishuAdapter {
     }
 }
 
-fn resolve_secret(
+fn resolve_secret_env(
     field_name: &str,
-    direct: Option<String>,
     env_name: Option<String>,
 ) -> Result<String> {
-    if let Some(value) = direct {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
+    let env_name = env_name
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow!("missing feishu {field_name}; configure it with an environment variable name"))?;
+
+    let value = std::env::var(&env_name)
+        .with_context(|| format!("failed to read env var `{env_name}` for feishu {field_name}"))?;
+    if !value.trim().is_empty() {
+        return Ok(value);
     }
 
-    if let Some(env_name) = env_name {
-        let value = std::env::var(&env_name).with_context(|| {
-            format!("failed to read env var `{env_name}` for feishu {field_name}")
-        })?;
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
-
-    bail!("missing feishu {field_name}; configure either `{field_name}` or `{field_name}_env`")
+    bail!("env var `{env_name}` for feishu {field_name} is empty")
 }
 
 fn extract_service_id(url: &str) -> Option<i32> {

@@ -90,7 +90,7 @@ impl Gateway {
 
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok(inner) => inner?,
+                Ok(()) => {}
                 Err(err) if err.is_cancelled() => {}
                 Err(err) => return Err(err.into()),
             }

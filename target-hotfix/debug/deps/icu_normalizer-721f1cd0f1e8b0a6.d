@@ -1,0 +1,10 @@
+C:\Users\Tingyu Liu\Documents\repo\codex-channel\target-hotfix\debug\deps\libicu_normalizer-721f1cd0f1e8b0a6.rmeta: C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\lib.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\properties.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\provider.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\uts46.rs
+
+C:\Users\Tingyu Liu\Documents\repo\codex-channel\target-hotfix\debug\deps\libicu_normalizer-721f1cd0f1e8b0a6.rlib: C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\lib.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\properties.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\provider.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\uts46.rs
+
+C:\Users\Tingyu Liu\Documents\repo\codex-channel\target-hotfix\debug\deps\icu_normalizer-721f1cd0f1e8b0a6.d: C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\lib.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\properties.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\provider.rs C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\uts46.rs
+
+C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\lib.rs:
+C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\properties.rs:
+C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\provider.rs:
+C:\Users\Tingyu\ Liu\.cargo\registry\src\index.crates.io-6f17d22bba15001f\icu_normalizer-2.1.1\src\uts46.rs:

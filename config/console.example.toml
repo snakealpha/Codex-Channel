@@ -1,0 +1,18 @@
+state_file = ".codex-channel/sessions.json"
+
+[adapter]
+type = "console"
+default_conversation_id = "openclaw"
+banner = """
+codex-channel console adapter is running.
+Type a message and press Enter.
+Use `thread-id > your message` to simulate multiple IM conversations.
+Use `/quit` to stop.
+"""
+
+[codex]
+working_directory = ".."
+skip_git_repo_check = false
+full_auto = false
+additional_writable_dirs = []
+extra_args = []

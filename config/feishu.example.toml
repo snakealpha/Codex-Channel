@@ -1,0 +1,15 @@
+state_file = ".codex-channel/sessions.json"
+
+[adapter]
+type = "feishu"
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+base_url = "https://open.feishu.cn"
+reconnect_interval_secs = 5
+
+[codex]
+working_directory = ".."
+skip_git_repo_check = false
+full_auto = false
+additional_writable_dirs = []
+extra_args = []

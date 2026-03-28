@@ -129,6 +129,19 @@ https_proxy = "http://127.0.0.1:7890"
 These values are injected into the `codex exec` child process as both uppercase and lowercase
 proxy environment variables.
 
+If `codex-channel` runs as a background service, Codex may not see the same trusted-project state
+as your interactive terminal. This is especially common on macOS when the gateway is started by
+`launchd`. If you see trust-related exits for a repository that already works in a terminal, set:
+
+```toml
+[codex]
+skip_git_repo_check = true
+```
+
+This is often the most reliable choice for service-style deployment. If you want to keep the check
+enabled, make sure the gateway process sees the same `HOME`, `PATH`, and working directory path that
+you used when trusting the repository manually.
+
 If `codex-channel` runs as a background service on macOS, prefer an absolute launcher path because
 `launchd` often has a much smaller `PATH` than your interactive terminal:
 
@@ -159,7 +172,7 @@ For a production-style setup on macOS:
 
 1. Copy `config/feishu.production.example.toml` to your own machine-specific location, such as `~/.config/codex-channel/feishu.production.toml`.
 2. Set `FEISHU_APP_ID` and `FEISHU_APP_SECRET` in the process environment. The config file should reference those variable names instead of storing raw credentials.
-3. Update `working_directory`, `state_file`, and proxy values for your machine.
+3. Update `working_directory`, `state_file`, proxy values, and usually `skip_git_repo_check = true` for your machine.
 4. Install the built binary somewhere stable, such as `~/.cargo/bin/codex-channel`.
 5. Set `launcher` in the config to the absolute path of the `codex` executable if you start the gateway from `launchd`.
 6. Load a `launchd` job based on `deploy/macos/com.codex-channel.example.plist`.

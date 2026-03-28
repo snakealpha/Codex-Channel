@@ -168,29 +168,16 @@ impl Gateway {
             effective_working_directory(&current_thread, &self.default_working_directory);
 
         if trimmed_text.starts_with("/review") {
-            adapter
-                .send(OutboundMessage {
-                    adapter: adapter_name.clone(),
-                    conversation_id: conversation_id.clone(),
-                    text: format!(
-                        "Codex is reviewing the current uncommitted changes in `{}`...",
-                        working_directory.display()
-                    ),
-                    is_partial: true,
-                    kind: OutboundMessageKind::Status,
-                })
-                .await?;
-
-            self.codex
-                .run_review(working_directory, move |event| {
-                    let adapter = adapter.clone();
-                    let adapter_name = adapter_name.clone();
-                    let conversation_id = conversation_id.clone();
-                    async move {
-                        forward_codex_event(adapter, adapter_name, conversation_id, event).await
-                    }
-                })
-                .await?;
+            self.send_notice(
+                &adapter_name,
+                &conversation_id,
+                format!(
+                    "`/review` is currently disabled. Current thread `{}` is at `{}`.",
+                    current_thread.alias,
+                    working_directory.display()
+                ),
+            )
+            .await?;
         } else {
             adapter
                 .send(OutboundMessage {

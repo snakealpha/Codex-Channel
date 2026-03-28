@@ -61,7 +61,6 @@ The gateway supports a few thread and workspace commands directly from IM:
 /thread use <name>
 /cd <path>
 /pwd
-/review
 ```
 
 Behavior:
@@ -72,7 +71,7 @@ Behavior:
 - `/thread use <name>` switches the current logical thread.
 - `/cd <path>` updates the working directory for the current logical thread.
 - `/pwd` shows the current thread, working directory, and session status.
-- `/review` runs against the current logical thread's working directory.
+- `/review` is currently disabled.
 
 ## Config
 

@@ -47,6 +47,7 @@ impl Gateway {
         let adapter = gateway.adapter.clone();
         let adapter_task = tokio::spawn(async move { adapter.run(inbound_tx).await });
         let mut tasks = JoinSet::new();
+        let mut shutting_down = false;
 
         loop {
             tokio::select! {
@@ -77,16 +78,34 @@ impl Gateway {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("received Ctrl+C, shutting down gateway");
+                    shutting_down = true;
                     break;
                 }
             }
         }
 
-        while let Some(result) = tasks.join_next().await {
-            result?;
+        if shutting_down {
+            tasks.abort_all();
         }
 
-        adapter_task.await??;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(inner) => inner?,
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        if shutting_down {
+            adapter_task.abort();
+        }
+
+        match adapter_task.await {
+            Ok(inner) => inner?,
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => return Err(err.into()),
+        }
+
         Ok(())
     }
 

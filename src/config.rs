@@ -12,6 +12,21 @@ pub struct GatewayConfig {
     pub codex: CodexConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelCoreConfig {
+    pub state_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrontendConfig {
+    pub adapter: AdapterConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendConfig {
+    pub codex: CodexConfig,
+}
+
 impl GatewayConfig {
     pub async fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
@@ -30,6 +45,18 @@ impl GatewayConfig {
             self.state_file = base_dir.join(&self.state_file);
         }
         self.codex.resolve_relative_paths(base_dir);
+    }
+
+    pub fn split(self) -> (ChannelCoreConfig, FrontendConfig, BackendConfig) {
+        (
+            ChannelCoreConfig {
+                state_file: self.state_file,
+            },
+            FrontendConfig {
+                adapter: self.adapter,
+            },
+            BackendConfig { codex: self.codex },
+        )
     }
 }
 
@@ -161,4 +188,27 @@ fn default_launcher() -> Vec<String> {
 #[cfg(not(target_os = "windows"))]
 fn default_launcher() -> Vec<String> {
     vec!["codex".to_owned()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdapterConfig, GatewayConfig};
+
+    #[test]
+    fn legacy_feishu_config_still_loads() {
+        let raw = r#"
+state_file = ".codex-channel/sessions.json"
+
+[adapter]
+type = "feishu"
+app_id = "FEISHU_APP_ID"
+app_secret = "FEISHU_APP_SECRET"
+
+[codex]
+working_directory = "."
+"#;
+
+        let config: GatewayConfig = toml::from_str(raw).expect("config");
+        assert!(matches!(config.adapter, AdapterConfig::Feishu(_)));
+    }
 }

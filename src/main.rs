@@ -1,3 +1,4 @@
+mod app;
 mod codex;
 mod codex_app_server;
 mod config;
@@ -15,8 +16,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use backend::traits::AgentBackend;
 use config::GatewayConfig;
+use app::gateway::Gateway;
 use frontend::traits::ChannelFrontend;
-use gateway::Gateway;
 use session_store::SessionStore;
 use tracing_subscriber::EnvFilter;
 
@@ -64,15 +65,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse()?;
     let config = GatewayConfig::load(&cli.config).await?;
-    let default_working_directory = config.codex.working_directory.clone();
-    let frontend: Arc<dyn ChannelFrontend> = frontend::build_frontend(&config.adapter)?;
-    let codex = Arc::new(codex::CodexCli::new(config.codex.clone()));
-    let backend: Arc<dyn AgentBackend> = if config.codex.use_app_server {
+    let (core_config, frontend_config, backend_config) = config.split();
+    let default_working_directory = backend_config.codex.working_directory.clone();
+    let frontend: Arc<dyn ChannelFrontend> = frontend::build_frontend(&frontend_config.adapter)?;
+    let codex = Arc::new(codex::CodexCli::new(backend_config.codex.clone()));
+    let backend: Arc<dyn AgentBackend> = if backend_config.codex.use_app_server {
         Arc::new(backend::codex::CodexAppServerBackend::new(codex))
     } else {
         Arc::new(backend::codex::CodexExecBackend::new(codex))
     };
-    let session_store = Arc::new(SessionStore::load(config.state_file.clone()).await?);
+    let session_store = Arc::new(SessionStore::load(core_config.state_file.clone()).await?);
 
     Gateway::new(frontend, backend, session_store, default_working_directory)
         .run()

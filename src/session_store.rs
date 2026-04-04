@@ -6,7 +6,8 @@ use serde::Deserialize;
 use tokio::fs;
 use tokio::sync::RwLock;
 
-use crate::model::{ConversationState, ThreadRecord};
+use crate::domain::conversation::ConversationState;
+use crate::domain::thread::ThreadRecord;
 
 pub struct SessionStore {
     path: PathBuf,
@@ -96,4 +97,18 @@ fn parse_session_snapshot(raw: &str) -> Result<HashMap<String, ConversationState
             )
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_session_snapshot;
+
+    #[test]
+    fn parses_legacy_session_snapshot_into_domain_conversation_state() {
+        let raw = r#"{"console::default":{"codex_thread_id":"thread-123"}}"#;
+        let snapshot = parse_session_snapshot(raw).expect("snapshot");
+        let state = snapshot.get("console::default").expect("conversation");
+        let thread = state.threads.get("main").expect("main thread");
+        assert_eq!(thread.codex_thread_id.as_deref(), Some("thread-123"));
+    }
 }

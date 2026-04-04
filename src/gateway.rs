@@ -14,9 +14,8 @@ use crate::codex::{
 };
 use crate::im::ImAdapter;
 use crate::model::{
-    conversation_key, CollaborationModePreset, ConversationState, InboundMessage,
-    OutboundMessage, OutboundMessageKind, PendingInteractionKind, PendingInteractionSummary,
-    ThreadRecord,
+    conversation_key, CollaborationModePreset, ConversationState, InboundMessage, OutboundMessage,
+    OutboundMessageKind, PendingInteractionKind, PendingInteractionSummary, ThreadRecord,
 };
 use crate::session_store::SessionStore;
 
@@ -27,6 +26,7 @@ pub struct Gateway {
     default_working_directory: PathBuf,
     conversation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     active_conversations: Mutex<HashSet<String>>,
+    user_input_drafts: Mutex<HashMap<String, serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl Gateway {
@@ -43,6 +43,7 @@ impl Gateway {
             default_working_directory,
             conversation_locks: Mutex::new(HashMap::new()),
             active_conversations: Mutex::new(HashSet::new()),
+            user_input_drafts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -120,9 +121,23 @@ impl Gateway {
         let key = conversation_key(&inbound.adapter, &inbound.conversation_id);
         let trimmed_text = inbound.text.trim();
 
+        info!(
+            adapter = inbound.adapter,
+            conversation_id = inbound.conversation_id,
+            sender = inbound.sender_id.as_deref().unwrap_or("unknown"),
+            text = inbound.text.as_str(),
+            trimmed_text,
+            "gateway received inbound message"
+        );
+
         if let Some(command) = parse_interaction_command(trimmed_text) {
             return self
-                .handle_interaction_command(command, &key, &inbound.adapter, &inbound.conversation_id)
+                .handle_interaction_command(
+                    command,
+                    &key,
+                    &inbound.adapter,
+                    &inbound.conversation_id,
+                )
                 .await;
         }
 
@@ -147,7 +162,7 @@ impl Gateway {
                 self.send_notice(
                     &adapter_name,
                     &conversation_id,
-                    "Codex is already busy in this conversation. Wait for the current turn to finish, or respond to the pending request with `/approve`, `/deny`, `/cancel`, `/reply`, or `/pending`.".to_owned(),
+                    "Codex is already busy in this conversation. Wait for the current turn to finish, or respond with:\n\n```text\n/approve\n/deny\n/cancel\n/reply your answer\n/pending\n```".to_owned(),
                 )
                 .await?;
                 return Ok(());
@@ -167,7 +182,7 @@ impl Gateway {
             self.send_notice(
                 &adapter_name,
                 &conversation_id,
-                "Codex is already working in this conversation. Wait for the current turn to finish, or answer the pending request with `/approve`, `/deny`, `/cancel`, `/reply`, or `/pending`.".to_owned(),
+                "Codex is already working in this conversation. Wait for the current turn to finish, or answer the pending request with:\n\n```text\n/approve\n/deny\n/cancel\n/reply your answer\n/pending\n```".to_owned(),
             )
             .await?;
             return Ok(());
@@ -280,9 +295,8 @@ impl Gateway {
                             .send(OutboundMessage {
                                 adapter: adapter_name.clone(),
                                 conversation_id: conversation_id.clone(),
-                                text:
-                                    "Previous Codex session stalled. Starting a fresh session..."
-                                        .to_owned(),
+                                text: "Previous Codex session stalled. Starting a fresh session..."
+                                    .to_owned(),
                                 is_partial: false,
                                 kind: OutboundMessageKind::Notice,
                                 pending_interaction: None,
@@ -346,12 +360,14 @@ impl Gateway {
             InteractionCommand::Pending => {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let text = format_pending_list(&pending);
-                self.send_notice(adapter_name, conversation_id, text).await?;
+                self.send_notice(adapter_name, conversation_id, text)
+                    .await?;
             }
             InteractionCommand::Approve(target) => {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let token = summary.token.clone();
+                self.clear_user_input_draft(key, &token).await;
                 self.codex
                     .respond_to_pending(&token, PendingInteractionAction::Approve)
                     .await?;
@@ -367,6 +383,7 @@ impl Gateway {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let token = summary.token.clone();
+                self.clear_user_input_draft(key, &token).await;
                 self.codex
                     .respond_to_pending(&token, PendingInteractionAction::ApproveForSession)
                     .await?;
@@ -382,6 +399,7 @@ impl Gateway {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let token = summary.token.clone();
+                self.clear_user_input_draft(key, &token).await;
                 self.codex
                     .respond_to_pending(&token, PendingInteractionAction::Deny)
                     .await?;
@@ -397,6 +415,7 @@ impl Gateway {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let token = summary.token.clone();
+                self.clear_user_input_draft(key, &token).await;
                 self.codex
                     .respond_to_pending(&token, PendingInteractionAction::Cancel)
                     .await?;
@@ -408,7 +427,10 @@ impl Gateway {
                 )
                 .await?;
             }
-            InteractionCommand::ReplyOther(target) => {
+            InteractionCommand::ReplyOther {
+                target,
+                question_id,
+            } => {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let ordinal = pending
@@ -417,38 +439,116 @@ impl Gateway {
                     .map(|index| index + 1);
 
                 let text = match &summary.kind {
-                    PendingInteractionKind::UserInputRequest { questions } if questions.len() == 1 => {
+                    PendingInteractionKind::UserInputRequest { questions }
+                        if questions.len() == 1 =>
+                    {
                         if pending.len() == 1 {
-                            "Send your custom answer with `/reply <your answer>`.".to_owned()
+                            "Send your custom answer like this:\n\n```text\n/reply your answer\n```"
+                                .to_owned()
                         } else if let Some(ordinal) = ordinal {
-                            format!("Send your custom answer with `/reply {ordinal} <your answer>`.")
+                            format!("Send your custom answer like this:\n\n```text\n/reply {ordinal} your answer\n```")
                         } else {
                             format!(
-                                "Send your custom answer with `/reply {} <your answer>`.",
+                                "Send your custom answer like this:\n\n```text\n/reply {} your answer\n```",
                                 summary.token
                             )
                         }
                     }
                     PendingInteractionKind::UserInputRequest { .. } => {
-                        format!(
-                            "This request needs structured input. Reply with `/reply {} {{\"question_id\": [\"your answer\"]}}`.",
-                            summary.token
-                        )
+                        let question_id = question_id.as_deref().unwrap_or("question_id");
+                        if pending.len() == 1 {
+                            format!(
+                                "Send your custom answer like this:\n\n```text\n/reply {question_id} your answer\n```"
+                            )
+                        } else if let Some(ordinal) = ordinal {
+                            format!(
+                                "Send your custom answer like this:\n\n```text\n/reply {ordinal} {question_id} your answer\n```"
+                            )
+                        } else {
+                            format!(
+                                "Send your custom answer like this:\n\n```text\n/reply {} {question_id} your answer\n```",
+                                summary.token
+                            )
+                        }
                     }
                     _ => "This pending Codex request does not accept free-form input.".to_owned(),
                 };
 
-                self.send_notice(adapter_name, conversation_id, text).await?;
+                self.send_notice(adapter_name, conversation_id, text)
+                    .await?;
             }
             InteractionCommand::ReplyText { target, text } => {
                 let pending = self.codex.list_pending_for_thread(thread_id).await?;
                 let summary = resolve_pending_target(&pending, &target)?;
                 let token = summary.token.clone();
+                if let PendingInteractionKind::UserInputRequest { questions } = &summary.kind {
+                    if questions.len() > 1 {
+                        let Some((question_id, answer_text)) =
+                            parse_multi_question_reply_text(&text, questions)
+                        else {
+                            self.send_notice(
+                                adapter_name,
+                                conversation_id,
+                                format!(
+                                    "This request still has multiple questions. Reply like this:\n\n```text\n/reply <question_id> your answer\n```\n\nIf there are multiple pending requests, use:\n\n```text\n/reply <item-number> <question_id> your answer\n```"
+                                ),
+                            )
+                            .await?;
+                            return Ok(());
+                        };
+
+                        let value = serde_json::json!({
+                            question_id: [answer_text]
+                        });
+
+                        let merged = merge_multi_question_answers(
+                            self.take_user_input_draft(key, &token).await,
+                            questions,
+                            value,
+                        )?;
+                        let is_complete = multi_question_answers_complete(questions, &merged);
+                        self.store_user_input_draft(key, &token, merged.clone())
+                            .await;
+
+                        if is_complete {
+                            self.clear_user_input_draft(key, &token).await;
+                            self.codex
+                                .respond_to_pending(
+                                    &token,
+                                    PendingInteractionAction::ReplyJson(serde_json::Value::Object(
+                                        merged,
+                                    )),
+                                )
+                                .await?;
+                            self.send_command_result(
+                                adapter_name,
+                                conversation_id,
+                                format!("Sent your response to Codex request `{token}`. Codex is continuing in this conversation."),
+                                Some(token),
+                            )
+                            .await?;
+                        } else {
+                            let remaining = remaining_multi_question_ids(questions, &merged);
+                            self.send_notice(
+                                adapter_name,
+                                conversation_id,
+                                format!(
+                                    "Saved your answer for Codex request `{token}`.\n\nRemaining question ids:\n\n```text\n{}\n```",
+                                    remaining.join("\n")
+                                ),
+                            )
+                            .await?;
+                        }
+                        return Ok(());
+                    }
+                }
+
                 let action = if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                     PendingInteractionAction::ReplyJson(value)
                 } else {
                     PendingInteractionAction::ReplyText(text)
                 };
+                self.clear_user_input_draft(key, &token).await;
                 self.codex.respond_to_pending(&token, action).await?;
                 self.send_command_result(
                     adapter_name,
@@ -473,9 +573,9 @@ impl Gateway {
     ) -> Result<()> {
         match command {
             ManagementCommand::ListThreads => {
-                let message =
-                    format_threads_message(state, &self.default_working_directory);
-                self.send_notice(adapter_name, conversation_id, message).await?;
+                let message = format_threads_message(state, &self.default_working_directory);
+                self.send_notice(adapter_name, conversation_id, message)
+                    .await?;
             }
             ManagementCommand::NewThread(alias) => {
                 let alias = alias.unwrap_or_else(|| next_thread_alias(state));
@@ -667,7 +767,8 @@ impl Gateway {
         conversation_id: &str,
         text: String,
     ) -> Result<()> {
-        self.send_command_result(adapter_name, conversation_id, text, None)
+        self.adapter
+            .send(build_notice_message(adapter_name, conversation_id, text))
             .await
     }
 
@@ -679,24 +780,50 @@ impl Gateway {
         dismiss_pending_token: Option<String>,
     ) -> Result<()> {
         self.adapter
-            .send(OutboundMessage {
-                adapter: adapter_name.to_owned(),
-                conversation_id: conversation_id.to_owned(),
+            .send(build_command_result_message(
+                adapter_name,
+                conversation_id,
                 text,
-                is_partial: false,
-                kind: OutboundMessageKind::CommandResult,
-                pending_interaction: None,
                 dismiss_pending_token,
-            })
+            ))
             .await
     }
 
-    async fn load_state(&self, key: &str) -> ConversationState {
-        let mut state = self
-            .session_store
-            .get(key)
+    async fn take_user_input_draft(
+        &self,
+        key: &str,
+        token: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        self.user_input_drafts
+            .lock()
             .await
-            .unwrap_or_else(|| ConversationState::with_default_thread(self.default_working_directory.clone()));
+            .remove(&pending_draft_key(key, token))
+            .unwrap_or_default()
+    }
+
+    async fn store_user_input_draft(
+        &self,
+        key: &str,
+        token: &str,
+        answers: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.user_input_drafts
+            .lock()
+            .await
+            .insert(pending_draft_key(key, token), answers);
+    }
+
+    async fn clear_user_input_draft(&self, key: &str, token: &str) {
+        self.user_input_drafts
+            .lock()
+            .await
+            .remove(&pending_draft_key(key, token));
+    }
+
+    async fn load_state(&self, key: &str) -> ConversationState {
+        let mut state = self.session_store.get(key).await.unwrap_or_else(|| {
+            ConversationState::with_default_thread(self.default_working_directory.clone())
+        });
         ensure_state_is_usable(&mut state, &self.default_working_directory);
         state
     }
@@ -706,7 +833,10 @@ impl Gateway {
     }
 
     async fn mark_conversation_active(&self, key: &str) {
-        self.active_conversations.lock().await.insert(key.to_owned());
+        self.active_conversations
+            .lock()
+            .await
+            .insert(key.to_owned());
     }
 
     async fn mark_conversation_inactive(&self, key: &str) {
@@ -740,8 +870,14 @@ enum InteractionCommand {
     ApproveForSession(PendingTarget),
     Deny(PendingTarget),
     Cancel(PendingTarget),
-    ReplyOther(PendingTarget),
-    ReplyText { target: PendingTarget, text: String },
+    ReplyOther {
+        target: PendingTarget,
+        question_id: Option<String>,
+    },
+    ReplyText {
+        target: PendingTarget,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,12 +935,16 @@ fn parse_interaction_command(text: &str) -> Option<InteractionCommand> {
         return Some(InteractionCommand::Pending);
     }
     if text == "/approve-session" {
-        return Some(InteractionCommand::ApproveForSession(PendingTarget::Implicit));
+        return Some(InteractionCommand::ApproveForSession(
+            PendingTarget::Implicit,
+        ));
     }
     if let Some(target) = text.strip_prefix("/approve-session ") {
         let target = target.trim();
         if !target.is_empty() {
-            return Some(InteractionCommand::ApproveForSession(parse_pending_target(target)));
+            return Some(InteractionCommand::ApproveForSession(parse_pending_target(
+                target,
+            )));
         }
     }
     if text == "/approve" {
@@ -835,12 +975,24 @@ fn parse_interaction_command(text: &str) -> Option<InteractionCommand> {
         }
     }
     if text == "/reply-other" {
-        return Some(InteractionCommand::ReplyOther(PendingTarget::Implicit));
+        return Some(InteractionCommand::ReplyOther {
+            target: PendingTarget::Implicit,
+            question_id: None,
+        });
     }
-    if let Some(target) = text.strip_prefix("/reply-other ") {
-        let target = target.trim();
-        if !target.is_empty() {
-            return Some(InteractionCommand::ReplyOther(parse_pending_target(target)));
+    if let Some(rest) = text.strip_prefix("/reply-other ") {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            if let Some((target, question_id)) = split_pending_target_and_text(rest) {
+                return Some(InteractionCommand::ReplyOther {
+                    target,
+                    question_id: Some(question_id.to_owned()),
+                });
+            }
+            return Some(InteractionCommand::ReplyOther {
+                target: parse_pending_target(rest),
+                question_id: None,
+            });
         }
     }
     if let Some(rest) = text.strip_prefix("/reply ") {
@@ -888,7 +1040,12 @@ fn is_explicit_pending_target(text: &str) -> bool {
         return true;
     }
 
-    if normalized.parse::<usize>().ok().filter(|index| *index > 0).is_some() {
+    if normalized
+        .parse::<usize>()
+        .ok()
+        .filter(|index| *index > 0)
+        .is_some()
+    {
         return true;
     }
 
@@ -901,9 +1058,7 @@ fn parse_pending_target(text: &str) -> PendingTarget {
         return PendingTarget::Implicit;
     }
 
-    if normalized.eq_ignore_ascii_case("last")
-        || normalized.eq_ignore_ascii_case("latest")
-    {
+    if normalized.eq_ignore_ascii_case("last") || normalized.eq_ignore_ascii_case("latest") {
         return PendingTarget::Last;
     }
 
@@ -1038,14 +1193,13 @@ fn format_pending_list(pending: &[PendingInteractionSummary]) -> String {
 
     let mut blocks = vec![
         "Pending Codex requests:".to_owned(),
-        "Use `/approve`, `/deny`, `/cancel`, or `/reply` directly when there is only one pending request. Otherwise use the item number shown below.".to_owned(),
+        "If there is only one pending request, reply with:".to_owned(),
+        "```text\n/approve\n/deny\n/cancel\n/reply your answer\n```".to_owned(),
+        "If there are multiple pending requests, use the item number shown below:".to_owned(),
+        "```text\n/approve 1\n/deny 1\n/cancel 1\n/reply 1 your answer\n```".to_owned(),
     ];
     for (index, summary) in pending.iter().enumerate() {
-        let body = format!(
-            "{}\n{}",
-            pending_summary_heading(summary),
-            summary.prompt
-        );
+        let body = format!("{}\n{}", pending_summary_heading(summary), summary.prompt);
         blocks.push(prefix_block(&format!("{}. ", index + 1), &body));
     }
     blocks.join("\n\n")
@@ -1063,7 +1217,11 @@ fn pending_summary_heading(summary: &PendingInteractionSummary) -> String {
             format!("Additional permissions (`{}`)", summary.token)
         }
         crate::model::PendingInteractionKind::UserInputRequest { questions } => {
-            format!("User input request (`{}`) | {} question(s)", summary.token, questions.len())
+            format!(
+                "User input request (`{}`) | {} question(s)",
+                summary.token,
+                questions.len()
+            )
         }
     }
 }
@@ -1084,6 +1242,132 @@ fn prefix_block(prefix: &str, block: &str) -> String {
     output
 }
 
+fn build_notice_message(
+    adapter_name: &str,
+    conversation_id: &str,
+    text: String,
+) -> OutboundMessage {
+    OutboundMessage {
+        adapter: adapter_name.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        text,
+        is_partial: false,
+        kind: OutboundMessageKind::Notice,
+        pending_interaction: None,
+        dismiss_pending_token: None,
+    }
+}
+
+fn build_command_result_message(
+    adapter_name: &str,
+    conversation_id: &str,
+    text: String,
+    dismiss_pending_token: Option<String>,
+) -> OutboundMessage {
+    OutboundMessage {
+        adapter: adapter_name.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        text,
+        is_partial: false,
+        kind: OutboundMessageKind::CommandResult,
+        pending_interaction: None,
+        dismiss_pending_token,
+    }
+}
+
+fn pending_draft_key(conversation_key: &str, token: &str) -> String {
+    format!("{conversation_key}::{token}")
+}
+
+fn merge_multi_question_answers(
+    mut existing: serde_json::Map<String, serde_json::Value>,
+    questions: &[serde_json::Value],
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let incoming = value
+        .as_object()
+        .ok_or_else(|| anyhow!("expected a JSON object mapping question ids to answers"))?;
+
+    for (question_id, answer_value) in incoming {
+        if !questions.iter().any(|question| {
+            question.get("id").and_then(serde_json::Value::as_str) == Some(question_id.as_str())
+        }) {
+            return Err(anyhow!("unknown question id `{question_id}`"));
+        }
+
+        let normalized = if let Some(text) = answer_value.as_str() {
+            serde_json::Value::Array(vec![serde_json::Value::String(text.to_owned())])
+        } else if let Some(values) = answer_value.as_array() {
+            let mut normalized = Vec::with_capacity(values.len());
+            for value in values {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("all answer values must be strings"))?;
+                normalized.push(serde_json::Value::String(text.to_owned()));
+            }
+            serde_json::Value::Array(normalized)
+        } else {
+            return Err(anyhow!(
+                "answer for question `{question_id}` must be a string or string array"
+            ));
+        };
+
+        existing.insert(question_id.clone(), normalized);
+    }
+
+    Ok(existing)
+}
+
+fn parse_multi_question_reply_text(
+    text: &str,
+    questions: &[serde_json::Value],
+) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    let split = trimmed.find(char::is_whitespace)?;
+    let question_id = trimmed[..split].trim();
+    let answer = trimmed[split..].trim();
+    if question_id.is_empty() || answer.is_empty() {
+        return None;
+    }
+    questions
+        .iter()
+        .any(|question| question.get("id").and_then(serde_json::Value::as_str) == Some(question_id))
+        .then(|| (question_id.to_owned(), answer.to_owned()))
+}
+
+fn multi_question_answers_complete(
+    questions: &[serde_json::Value],
+    answers: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    questions.iter().all(|question| {
+        question
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|question_id| answers.get(question_id))
+            .and_then(serde_json::Value::as_array)
+            .map(|answers| !answers.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn remaining_multi_question_ids(
+    questions: &[serde_json::Value],
+    answers: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let question_id = question.get("id").and_then(serde_json::Value::as_str)?;
+            let answered = answers
+                .get(question_id)
+                .and_then(serde_json::Value::as_array)
+                .map(|answers| !answers.is_empty())
+                .unwrap_or(false);
+            (!answered).then(|| question_id.to_owned())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1091,7 +1375,8 @@ mod tests {
         resolve_pending_target, InteractionCommand, ManagementCommand, PendingTarget,
     };
     use crate::model::{
-        CollaborationModePreset, PendingInteractionKind, PendingInteractionSummary,
+        CollaborationModePreset, OutboundMessageKind, PendingInteractionKind,
+        PendingInteractionSummary,
     };
     use serde_json::json;
 
@@ -1147,18 +1432,17 @@ mod tests {
 
     #[test]
     fn resolve_implicit_target_requires_single_pending_item() {
-        let pending = vec![
-            sample_pending("req-1"),
-            sample_pending("req-2"),
-        ];
-        let err = resolve_pending_target(&pending, &PendingTarget::Implicit).expect_err("should fail");
-        assert!(err.to_string().contains("There are 2 pending Codex requests"));
+        let pending = vec![sample_pending("req-1"), sample_pending("req-2")];
+        let err =
+            resolve_pending_target(&pending, &PendingTarget::Implicit).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("There are 2 pending Codex requests"));
     }
 
     #[test]
     fn reply_with_plain_text_sentence_keeps_whole_answer() {
-        let command =
-            parse_interaction_command("/reply my custom answer").expect("command");
+        let command = parse_interaction_command("/reply my custom answer").expect("command");
         assert!(matches!(
             command,
             InteractionCommand::ReplyText {
@@ -1170,8 +1454,7 @@ mod tests {
 
     #[test]
     fn reply_with_req_token_keeps_explicit_target() {
-        let command =
-            parse_interaction_command("/reply req-3 my custom answer").expect("command");
+        let command = parse_interaction_command("/reply req-3 my custom answer").expect("command");
         assert!(matches!(
             command,
             InteractionCommand::ReplyText {
@@ -1183,10 +1466,7 @@ mod tests {
 
     #[test]
     fn resolve_last_target_returns_most_recent_item() {
-        let pending = vec![
-            sample_pending("req-1"),
-            sample_pending("req-2"),
-        ];
+        let pending = vec![sample_pending("req-1"), sample_pending("req-2")];
         let summary = resolve_pending_target(&pending, &PendingTarget::Last).expect("summary");
         assert_eq!(summary.token, "req-2");
     }
@@ -1211,8 +1491,75 @@ mod tests {
     fn parses_reply_other_command() {
         assert!(matches!(
             parse_interaction_command("/reply-other"),
-            Some(InteractionCommand::ReplyOther(PendingTarget::Implicit))
+            Some(InteractionCommand::ReplyOther {
+                target: PendingTarget::Implicit,
+                question_id: None,
+            })
         ));
+    }
+
+    #[test]
+    fn parses_reply_other_with_question_id() {
+        assert!(matches!(
+            parse_interaction_command("/reply-other req-3 color_choice"),
+            Some(InteractionCommand::ReplyOther {
+                target: PendingTarget::Token(token),
+                question_id: Some(question_id),
+            }) if token == "req-3" && question_id == "color_choice"
+        ));
+    }
+
+    #[test]
+    fn merges_multi_question_answers_until_complete() {
+        let questions = vec![json!({ "id": "q1" }), json!({ "id": "q2" })];
+        let merged = super::merge_multi_question_answers(
+            serde_json::Map::new(),
+            &questions,
+            json!({ "q1": ["A"] }),
+        )
+        .expect("merge");
+        assert!(!super::multi_question_answers_complete(&questions, &merged));
+        assert_eq!(
+            super::remaining_multi_question_ids(&questions, &merged),
+            vec!["q2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_multi_question_reply_text_as_plain_text_pair() {
+        let questions = vec![
+            json!({ "id": "color_choice" }),
+            json!({ "id": "size_choice" }),
+        ];
+
+        let parsed =
+            super::parse_multi_question_reply_text("color_choice deep navy blue", &questions);
+        assert_eq!(
+            parsed,
+            Some(("color_choice".to_owned(), "deep navy blue".to_owned()))
+        );
+    }
+
+    #[test]
+    fn builds_notice_message_with_notice_kind() {
+        let message = super::build_notice_message("feishu", "chat-1", "hello".to_owned());
+        assert!(matches!(message.kind, OutboundMessageKind::Notice));
+        assert_eq!(message.adapter, "feishu");
+        assert_eq!(message.conversation_id, "chat-1");
+        assert_eq!(message.text, "hello");
+        assert!(message.dismiss_pending_token.is_none());
+    }
+
+    #[test]
+    fn builds_command_result_message_with_command_result_kind() {
+        let message = super::build_command_result_message(
+            "feishu",
+            "chat-1",
+            "done".to_owned(),
+            Some("req-1".to_owned()),
+        );
+        assert!(matches!(message.kind, OutboundMessageKind::CommandResult));
+        assert_eq!(message.dismiss_pending_token.as_deref(), Some("req-1"));
     }
 
     fn sample_pending(token: &str) -> PendingInteractionSummary {
@@ -1296,17 +1643,18 @@ async fn resolve_directory(current_directory: &Path, raw_path: &str) -> Result<P
     Ok(fs::canonicalize(&combined).await.unwrap_or(combined))
 }
 
-fn format_threads_message(
-    state: &ConversationState,
-    default_working_directory: &Path,
-) -> String {
+fn format_threads_message(state: &ConversationState, default_working_directory: &Path) -> String {
     let mut aliases = state.threads.keys().cloned().collect::<Vec<_>>();
     aliases.sort();
 
     let mut lines = vec!["Known threads:".to_owned()];
     for alias in aliases {
         if let Some(thread) = state.threads.get(&alias) {
-            let marker = if alias == state.current_thread { "*" } else { "-" };
+            let marker = if alias == state.current_thread {
+                "*"
+            } else {
+                "-"
+            };
             let working_directory = effective_working_directory(thread, default_working_directory);
             let session = thread
                 .codex_thread_id

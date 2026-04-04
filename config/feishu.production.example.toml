@@ -18,7 +18,7 @@ launcher = ["/Users/your-name/.cargo/bin/codex"]
 working_directory = "/Users/your-name/workspaces/openclaw"
 use_app_server = true
 # codex-channel starts `codex app-server` for you. No separate daemon is needed.
-app_server_url = "ws://127.0.0.1:8765"
+app_server_url = "ws://127.0.0.1:54321"
 sandbox = "workspace-write"
 ask_for_approval = "on-request"
 search = false

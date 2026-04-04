@@ -150,7 +150,7 @@ fn default_turn_timeout_secs() -> u64 {
 }
 
 fn default_app_server_url() -> String {
-    "ws://127.0.0.1:8765".to_owned()
+    "ws://127.0.0.1:54321".to_owned()
 }
 
 #[cfg(target_os = "windows")]

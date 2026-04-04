@@ -14,7 +14,7 @@ Use `/quit` to stop.
 launcher = ["codex"]
 working_directory = ".."
 use_app_server = true
-app_server_url = "ws://127.0.0.1:8765"
+app_server_url = "ws://127.0.0.1:54321"
 sandbox = "workspace-write"
 ask_for_approval = "on-request"
 search = false

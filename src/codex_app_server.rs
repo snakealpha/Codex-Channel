@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Url;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -57,10 +59,16 @@ impl AppServerClient {
         };
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let mut completion_rx = connection.register_active_turn(thread_id.clone(), event_tx).await?;
+        let mut completion_rx = connection
+            .register_active_turn(thread_id.clone(), event_tx)
+            .await?;
 
         if let Err(err) = connection
-            .start_turn(&thread_id, &request.prompt, request.collaboration_mode.as_ref())
+            .start_turn(
+                &thread_id,
+                &request.prompt,
+                request.collaboration_mode.as_ref(),
+            )
             .await
         {
             connection.unregister_active_turn(&thread_id).await;
@@ -162,7 +170,8 @@ struct AppServerTurnResult {
 
 impl AppServerConnection {
     async fn spawn(config: CodexConfig) -> Result<Arc<Self>> {
-        let mut child = build_app_server_command(&config)?;
+        let listen_url = resolve_listen_url(&config.app_server_url)?;
+        let mut child = build_app_server_command(&config, &listen_url)?;
         child.kill_on_drop(true);
         let mut child = child
             .spawn()
@@ -186,13 +195,17 @@ impl AppServerConnection {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let line = line.trim();
                     if !line.is_empty() {
-                        warn!("codex app-server stderr: {line}");
+                        if is_probably_app_server_error(line) {
+                            warn!("codex app-server stderr: {line}");
+                        } else {
+                            debug!("codex app-server stderr: {line}");
+                        }
                     }
                 }
             });
         }
 
-        let socket = connect_with_retry(&config.app_server_url).await?;
+        let socket = connect_with_retry(&listen_url).await?;
         let (mut writer, mut reader) = socket.split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
 
@@ -424,7 +437,9 @@ impl AppServerConnection {
 
         timeout(Duration::from_secs(APP_SERVER_RPC_TIMEOUT_SECS), rx)
             .await
-            .with_context(|| format!("timed out waiting for codex app-server response to `{method}`"))?
+            .with_context(|| {
+                format!("timed out waiting for codex app-server response to `{method}`")
+            })?
             .map_err(|_| anyhow!("codex app-server response channel closed for `{method}`"))?
     }
 
@@ -435,7 +450,8 @@ impl AppServerConnection {
     }
 
     async fn handle_incoming_message(&self, text: &str) -> Result<()> {
-        let value: Value = serde_json::from_str(text).context("invalid json from codex app-server")?;
+        let value: Value =
+            serde_json::from_str(text).context("invalid json from codex app-server")?;
         let Some(object) = value.as_object() else {
             return Ok(());
         };
@@ -532,10 +548,13 @@ impl AppServerConnection {
                     .and_then(Value::as_str)
                     .unwrap_or("failed");
                 if status == "completed" {
-                    self.complete_turn(&thread_id, Ok(AppServerTurnResult {
-                        thread_id: thread_id.clone(),
-                    }))
-                        .await;
+                    self.complete_turn(
+                        &thread_id,
+                        Ok(AppServerTurnResult {
+                            thread_id: thread_id.clone(),
+                        }),
+                    )
+                    .await;
                 } else {
                     let message = turn
                         .get("error")
@@ -633,9 +652,7 @@ impl AppServerConnection {
         );
         self.forward_to_turn(
             &thread_id,
-            AppServerTurnEvent::Forward(CodexStreamEvent::PendingInteraction(
-                kind.summary(token),
-            )),
+            AppServerTurnEvent::Forward(CodexStreamEvent::PendingInteraction(kind.summary(token))),
         )
         .await;
     }
@@ -715,7 +732,7 @@ impl AppServerConnection {
     }
 }
 
-fn build_app_server_command(config: &CodexConfig) -> Result<Command> {
+fn build_app_server_command(config: &CodexConfig, listen_url: &str) -> Result<Command> {
     let program = config
         .launcher
         .first()
@@ -730,13 +747,55 @@ fn build_app_server_command(config: &CodexConfig) -> Result<Command> {
     apply_proxy_environment(&mut command, config);
     command.arg("app-server");
     command.arg("--listen");
-    command.arg(&config.app_server_url);
+    command.arg(listen_url);
     command.arg("--session-source");
     command.arg(APP_SERVER_SESSION_SOURCE);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     Ok(command)
+}
+
+fn resolve_listen_url(configured_url: &str) -> Result<String> {
+    let url = Url::parse(configured_url)
+        .with_context(|| format!("invalid app-server url `{configured_url}`"))?;
+
+    if url.scheme() != "ws" {
+        return Ok(configured_url.to_owned());
+    }
+
+    let host = url.host_str().unwrap_or_default();
+    if host != "127.0.0.1" && host != "localhost" {
+        return Ok(configured_url.to_owned());
+    }
+
+    let Some(port) = url.port() else {
+        return Ok(configured_url.to_owned());
+    };
+
+    match StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(configured_url.to_owned())
+        }
+        Err(err) => {
+            let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .context("failed to reserve a fallback local port for codex app-server")?;
+            let fallback_port = listener
+                .local_addr()
+                .context("failed to read fallback local port for codex app-server")?
+                .port();
+            drop(listener);
+            let fallback_url = format!("ws://127.0.0.1:{fallback_port}");
+            warn!(
+                configured_url,
+                fallback_url,
+                error = %err,
+                "codex app-server listen url is unavailable, falling back to a random local port"
+            );
+            Ok(fallback_url)
+        }
+    }
 }
 
 fn apply_proxy_environment(command: &mut Command, config: &CodexConfig) {
@@ -750,12 +809,22 @@ fn apply_proxy_environment(command: &mut Command, config: &CodexConfig) {
     apply_optional_env(command, "no_proxy", config.no_proxy.as_deref());
 }
 
+fn is_probably_app_server_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains(" error")
+        || lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("timed out")
+        || lower.contains("permission denied")
+        || lower.contains("could not")
+        || lower.contains("os error")
+}
+
 async fn connect_with_retry(
     url: &str,
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
     let mut last_error = None;
     for _ in 0..25 {
@@ -885,9 +954,9 @@ fn build_interaction_response(
                 }))
             }
             PendingInteractionAction::ReplyJson(value) => {
-                let answers = value
-                    .as_object()
-                    .ok_or_else(|| anyhow!("expected a JSON object mapping question ids to answers"))?;
+                let answers = value.as_object().ok_or_else(|| {
+                    anyhow!("expected a JSON object mapping question ids to answers")
+                })?;
                 let mut mapped = Map::new();
                 for (question_id, answer_value) in answers {
                     let answer_list = if let Some(text) = answer_value.as_str() {
@@ -896,13 +965,16 @@ fn build_interaction_response(
                         values
                             .iter()
                             .map(|value| {
-                                value.as_str()
+                                value
+                                    .as_str()
                                     .map(|text| Value::String(text.to_owned()))
                                     .ok_or_else(|| anyhow!("all answer values must be strings"))
                             })
                             .collect::<Result<Vec<_>>>()?
                     } else {
-                        bail!("answer for question `{question_id}` must be a string or string array");
+                        bail!(
+                            "answer for question `{question_id}` must be a string or string array"
+                        );
                     };
 
                     mapped.insert(
@@ -925,5 +997,44 @@ fn build_interaction_response(
                 bail!("this codex request expects user input, not an approval decision")
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_probably_app_server_error, resolve_listen_url};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+
+    #[test]
+    fn keeps_non_local_ws_url() {
+        let url = resolve_listen_url("ws://192.168.1.10:54321").expect("resolved url");
+        assert_eq!(url, "ws://192.168.1.10:54321");
+    }
+
+    #[test]
+    fn falls_back_when_local_port_is_already_bound() {
+        let listener =
+            StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind test");
+        let occupied_port = listener.local_addr().expect("local addr").port();
+
+        let url =
+            resolve_listen_url(&format!("ws://127.0.0.1:{occupied_port}")).expect("resolved url");
+
+        assert_ne!(url, format!("ws://127.0.0.1:{occupied_port}"));
+        assert!(url.starts_with("ws://127.0.0.1:"));
+    }
+
+    #[test]
+    fn classifies_normal_app_server_telemetry_as_non_error() {
+        assert!(!is_probably_app_server_error(
+            "INFO session_loop: response.completed"
+        ));
+    }
+
+    #[test]
+    fn classifies_real_app_server_failures_as_error() {
+        assert!(is_probably_app_server_error(
+            "Error: failed to bind websocket listener (os error 10048)"
+        ));
     }
 }

@@ -83,7 +83,11 @@ impl CodexCli {
         }
     }
 
-    pub async fn run_review<F, Fut>(&self, working_directory: PathBuf, mut on_event: F) -> Result<()>
+    pub async fn run_review<F, Fut>(
+        &self,
+        working_directory: PathBuf,
+        mut on_event: F,
+    ) -> Result<()>
     where
         F: FnMut(CodexStreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,

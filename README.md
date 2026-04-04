@@ -113,6 +113,7 @@ Behavior:
 - `/approve`, `/approve-session`, `/deny`, `/cancel`, and `/reply` respond to pending Codex requests.
 - If there is only one pending request, you can omit the target entirely, for example `/approve` or `/reply use the second option`.
 - If there are multiple pending requests, run `/pending` and then use the shown item number, for example `/approve 2`, `/deny 3`, or `/reply 1 use the second option`.
+- For multi-question Codex prompts, answer one question at a time with `/reply <question_id> <answer>`, or `/reply 2 <question_id> <answer>` if there are multiple pending requests.
 - Raw tokens like `req-3` still work, but they are no longer required for normal phone-friendly usage.
 - `/review` is currently disabled.
 
@@ -134,7 +135,7 @@ reconnect_interval_secs = 5
 launcher = ["codex"]
 working_directory = ".."
 use_app_server = true
-app_server_url = "ws://127.0.0.1:8765"
+app_server_url = "ws://127.0.0.1:54321"
 sandbox = "workspace-write"
 ask_for_approval = "on-request"
 search = false
@@ -190,7 +191,7 @@ If you want IM-routed approvals and `request_user_input`, switch to app-server m
 ```toml
 [codex]
 use_app_server = true
-app_server_url = "ws://127.0.0.1:8765"
+app_server_url = "ws://127.0.0.1:54321"
 ask_for_approval = "on-request"
 ```
 

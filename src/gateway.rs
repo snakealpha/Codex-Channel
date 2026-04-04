@@ -1,1 +1,3 @@
-pub use crate::app::gateway::Gateway;
+#![allow(dead_code)]
+
+pub type Gateway = crate::app::gateway::Gateway;

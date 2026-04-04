@@ -16,11 +16,14 @@ config/console.example.toml   Console adapter example
 config/feishu.example.toml    Feishu adapter example
 config/feishu.production.example.toml macOS production example
 src/main.rs                   Entry point
-src/gateway.rs                Core routing and per-conversation session binding
-src/codex.rs                  Codex CLI JSONL bridge
+src/app/                      Application gateway and services
+src/backend/                  Backend abstractions and Codex backends
+src/frontend/                 Frontend abstractions and frontend implementations
+src/domain/                   Shared domain models
+src/gateway.rs                Compatibility re-export for the gateway
+src/codex.rs                  Codex CLI bridge
 src/codex_app_server.rs       Codex app-server bridge
-src/im/console.rs             Local console adapter
-src/im/feishu.rs              Feishu long-connection adapter
+src/im/                       Compatibility shims for legacy adapter paths
 src/session_store.rs          Persistent session store
 ```
 

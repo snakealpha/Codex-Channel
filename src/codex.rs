@@ -74,6 +74,8 @@ impl CodexCli {
         }
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub async fn run_review<F, Fut>(
         &self,
         working_directory: PathBuf,
@@ -302,6 +304,8 @@ impl CodexCli {
         Ok(command)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn build_review_command(&self, working_directory: &PathBuf) -> Result<Command> {
         let program = self
             .config

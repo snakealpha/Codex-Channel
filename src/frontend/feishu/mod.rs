@@ -1119,6 +1119,8 @@ fn build_pending_interaction_card(
     })
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn build_notice_card(text: &str) -> serde_json::Value {
     serde_json::json!({
         "config": {
@@ -1529,6 +1531,8 @@ fn multi_question_action_sections(
     sections
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn pending_card_header(summary: &PendingInteractionSummary) -> (&'static str, &'static str) {
     match &summary.kind {
         PendingInteractionKind::CommandApproval { .. } => ("Codex 命令审批", "orange"),
@@ -1538,6 +1542,8 @@ fn pending_card_header(summary: &PendingInteractionSummary) -> (&'static str, &'
     }
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn pending_card_markdown(summary: &PendingInteractionSummary) -> String {
     match &summary.kind {
         PendingInteractionKind::CommandApproval { command, cwd, reason } => format!(
@@ -1594,6 +1600,8 @@ fn pending_card_markdown(summary: &PendingInteractionSummary) -> String {
     }
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn pending_card_actions(
     conversation_id: &str,
     summary: &PendingInteractionSummary,
@@ -1960,6 +1968,7 @@ impl ResponseEnvelope {
         }
     }
 
+    #[allow(dead_code)]
     fn with_success_card(content: impl Into<String>, card: serde_json::Value) -> Self {
         Self {
             code: 200,

@@ -46,6 +46,9 @@ Feishu mode:
 ./target/release/codex-channel --config ~/.config/codex-channel/feishu.production.toml
 ```
 
+When `use_app_server = true`, `codex-channel` will start `codex app-server` itself by using the
+configured `launcher`. You do not need to run a separate app-server daemon first.
+
 On macOS (Apple Silicon), build natively with:
 
 ```bash
@@ -239,9 +242,13 @@ For a production-style setup on macOS:
 3. Update `working_directory`, `state_file`, sandbox, approval policy, proxy values, and usually `skip_git_repo_check = true` for your machine.
 4. Install the built binary somewhere stable, such as `~/.cargo/bin/codex-channel`.
 5. Set `launcher` in the config to the absolute path of the `codex` executable if you start the gateway from `launchd`.
-6. Load a `launchd` job based on `deploy/macos/com.codex-channel.example.plist`.
+6. Keep `use_app_server = true` if you want IM-routed approvals. `codex-channel` will launch `codex app-server` itself and connect to the configured local websocket address.
+7. Load a `launchd` job based on `deploy/macos/com.codex-channel.example.plist`.
 
 The sample plist includes placeholder environment variables for clarity. On a real machine, replace them with your own values before loading it.
+It also sets `HOME`, `PATH`, and `NO_PROXY`, which are usually important on macOS when the gateway
+needs to find `codex`, reuse your Codex auth/config files, and connect to the local app-server
+socket without proxying loopback traffic.
 
 Useful `launchd` commands:
 

@@ -1,4 +1,7 @@
-state_file = "/Users/your-name/.codex-channel/sessions.json"
+# macOS production example.
+# Copy this file to ~/.config/codex-channel/feishu.production.toml and
+# replace the placeholder paths with real absolute paths on your machine.
+state_file = "/Users/your-name/.config/codex-channel/sessions.json"
 
 [adapter]
 type = "feishu"
@@ -8,9 +11,13 @@ base_url = "https://open.feishu.cn"
 reconnect_interval_secs = 5
 
 [codex]
+# Use an absolute path when the gateway runs from launchd.
 launcher = ["/Users/your-name/.cargo/bin/codex"]
+# This is the default workspace for new IM threads. You can still change it
+# later from IM with /cd.
 working_directory = "/Users/your-name/workspaces/openclaw"
 use_app_server = true
+# codex-channel starts `codex app-server` for you. No separate daemon is needed.
 app_server_url = "ws://127.0.0.1:8765"
 sandbox = "workspace-write"
 ask_for_approval = "on-request"
@@ -21,11 +28,13 @@ all_proxy = ""
 no_proxy = "127.0.0.1,localhost"
 model = "gpt-5.4"
 profile = ""
+# launchd often does not see the same trusted-project state as your shell.
 skip_git_repo_check = true
 full_auto = false
 turn_timeout_secs = 90
 additional_writable_dirs = [
   "/Users/your-name/workspaces/other-repo",
   "/Users/your-name/data",
+  "/Users/your-name/Library/Logs",
 ]
 extra_args = []

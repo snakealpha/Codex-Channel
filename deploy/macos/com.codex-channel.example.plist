@@ -17,6 +17,10 @@
 
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HOME</key>
+    <string>/Users/your-name</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/your-name/.cargo/bin</string>
     <key>FEISHU_APP_ID</key>
     <string>cli_xxx</string>
     <key>FEISHU_APP_SECRET</key>
@@ -25,6 +29,10 @@
     <string>http://127.0.0.1:7890</string>
     <key>HTTPS_PROXY</key>
     <string>http://127.0.0.1:7890</string>
+    <key>NO_PROXY</key>
+    <string>127.0.0.1,localhost</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
   </dict>
 
   <key>KeepAlive</key>

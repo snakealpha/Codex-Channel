@@ -83,6 +83,7 @@ fn parse_session_snapshot(raw: &str) -> Result<HashMap<String, ConversationState
                     alias: "main".to_owned(),
                     codex_thread_id: Some(value.codex_thread_id),
                     working_directory: None,
+                    collaboration_mode: None,
                 },
             );
 

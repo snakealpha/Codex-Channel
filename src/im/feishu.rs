@@ -7,16 +7,24 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use reqwest::Client;
+use reqwest::Url;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{interval, sleep};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{client_async_tls, connect_async};
+use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::FeishuAdapterConfig;
 use crate::im::ImAdapter;
-use crate::model::{InboundMessage, OutboundMessage, OutboundMessageKind};
+use crate::model::{
+    InboundMessage, OutboundMessage, OutboundMessageKind, PendingInteractionKind,
+    PendingInteractionSummary,
+};
 
 const FEISHU_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
 const FEISHU_TENANT_TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
@@ -40,6 +48,7 @@ pub struct FeishuAdapter {
     outbound_tx: Arc<Mutex<Option<mpsc::Sender<OutboundMessage>>>>,
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     conversation_state: Arc<Mutex<HashMap<String, ConversationStreamState>>>,
+    pending_card_messages: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuAdapter {
@@ -63,6 +72,7 @@ impl FeishuAdapter {
             outbound_tx: Arc::new(Mutex::new(None)),
             tenant_token: Arc::new(RwLock::new(None)),
             conversation_state: Arc::new(Mutex::new(HashMap::new())),
+            pending_card_messages: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -86,7 +96,7 @@ impl FeishuAdapter {
             .ok_or_else(|| anyhow!("feishu websocket url missing service_id query parameter"))?;
 
         info!("connecting to feishu long connection websocket");
-        let (socket, _) = connect_async(&endpoint.url)
+        let socket = connect_feishu_websocket(&endpoint.url)
             .await
             .context("failed to connect to feishu websocket")?;
         let (mut writer, mut reader) = socket.split();
@@ -235,57 +245,106 @@ impl FeishuAdapter {
         let event: EventEnvelope = serde_json::from_slice(&frame.payload)
             .context("failed to parse feishu event payload")?;
 
-        if event.header.event_type != "im.message.receive_v1" {
-            return Ok(Some(build_response_frame(
-                frame,
-                FrameHeaders::from(headers)
-                    .with(HEADER_BIZ_RT, start.elapsed().as_millis().to_string()),
-                ResponseEnvelope::ok(),
-            )?));
-        }
+        let response = match event.header.event_type.as_str() {
+            "im.message.receive_v1" => {
+                if let Some(message) = event.event.message.as_ref() {
+                    if message.message_type.as_deref() == Some("text") {
+                        if let Some(text) = message.extract_text()? {
+                            let conversation_id = message
+                                .thread_id
+                                .clone()
+                                .or_else(|| message.chat_id.clone())
+                                .ok_or_else(|| {
+                                    anyhow!("feishu event missing both thread_id and chat_id")
+                                })?;
 
-        if let Some(message) = event.event.message.as_ref() {
-            if message.message_type.as_deref() == Some("text") {
-                if let Some(text) = message.extract_text()? {
-                    let conversation_id = message
-                        .thread_id
-                        .clone()
-                        .or_else(|| message.chat_id.clone())
-                        .ok_or_else(|| {
-                            anyhow!("feishu event missing both thread_id and chat_id")
-                        })?;
-
+                            inbound
+                                .send(InboundMessage {
+                                    adapter: self.name().to_owned(),
+                                    conversation_id,
+                                    sender_id: event
+                                        .event
+                                        .sender
+                                        .as_ref()
+                                        .and_then(|sender| sender.sender_id.as_ref())
+                                        .and_then(|id| {
+                                            id.open_id
+                                                .clone()
+                                                .or_else(|| id.user_id.clone())
+                                                .or_else(|| id.union_id.clone())
+                                        }),
+                                    text,
+                                })
+                                .await
+                                .map_err(|_| {
+                                    anyhow!(
+                                        "gateway stopped before feishu message could be delivered"
+                                    )
+                                })?;
+                        }
+                    }
+                }
+                ResponseEnvelope::ok()
+            }
+            "card.action.trigger" => {
+                if let Some(action) = self.card_action_to_inbound(&event)? {
+                    info!(
+                        token = action.token.as_deref().unwrap_or("<missing>"),
+                        selected_label = action.selected_label.as_deref().unwrap_or("<missing>"),
+                        callback_message_id = action.open_message_id.as_deref().unwrap_or("<missing>"),
+                        "received feishu card action"
+                    );
                     inbound
-                        .send(InboundMessage {
-                            adapter: self.name().to_owned(),
-                            conversation_id,
-                            sender_id: event
-                                .event
-                                .sender
-                                .as_ref()
-                                .and_then(|sender| sender.sender_id.as_ref())
-                                .and_then(|id| {
-                                    id.open_id
-                                        .clone()
-                                        .or_else(|| id.user_id.clone())
-                                        .or_else(|| id.union_id.clone())
-                                }),
-                            text,
-                        })
+                        .send(action.message)
                         .await
-                        .map_err(|_| {
-                            anyhow!("gateway stopped before feishu message could be delivered")
-                        })?;
+                        .map_err(|_| anyhow!("gateway stopped before feishu card action could be delivered"))?;
+                    let stored_message_id = if let Some(token) = action.token.as_deref() {
+                        let mut pending_cards = self.pending_card_messages.lock().await;
+                        if action.delete_after_action {
+                            pending_cards.remove(token)
+                        } else {
+                            pending_cards.get(token).cloned()
+                        }
+                    } else {
+                        None
+                    };
+                    debug!(
+                        token = action.token.as_deref().unwrap_or("<missing>"),
+                        stored_message_id = stored_message_id.as_deref().unwrap_or("<missing>"),
+                        callback_message_id = action.open_message_id.as_deref().unwrap_or("<missing>"),
+                        "resolved feishu card action message ids"
+                    );
+                    if action.delete_after_action {
+                        if let Some(message_id) = stored_message_id
+                            .as_deref()
+                            .or(action.open_message_id.as_deref())
+                        {
+                            if let Err(err) = self
+                                .delete_message(message_id)
+                                .await
+                            {
+                                warn!("failed to delete feishu interaction card after action: {err:#}");
+                            }
+                        } else {
+                            warn!("feishu card action did not include any message id to delete");
+                        }
+                    } else {
+                        debug!("keeping feishu interaction card in place after action");
+                    }
+                    ResponseEnvelope::with_success_toast("Sent to Codex")
+                } else {
+                    ResponseEnvelope::ok()
                 }
             }
-        }
+            _ => ResponseEnvelope::ok(),
+        };
 
         let response_headers = FrameHeaders::from(headers)
             .with(HEADER_BIZ_RT, start.elapsed().as_millis().to_string());
         Ok(Some(build_response_frame(
             frame,
             response_headers,
-            ResponseEnvelope::ok(),
+            response,
         )?))
     }
 
@@ -315,8 +374,7 @@ impl FeishuAdapter {
                     "upserting feishu agent message"
                 );
                 if message.is_partial {
-                    self.upsert_stream_message(&message.conversation_id, &message.text, true)
-                        .await
+                    Ok(())
                 } else {
                     self.upsert_stream_message(&message.conversation_id, &message.text, false)
                         .await
@@ -338,13 +396,120 @@ impl FeishuAdapter {
                     conversation_id = message.conversation_id,
                     "sending feishu command result message"
                 );
+                if let Some(token) = message.dismiss_pending_token.as_deref() {
+                    let message_id = self.pending_card_messages.lock().await.remove(token);
+                    if let Some(message_id) = message_id {
+                        if let Err(err) = self.delete_message(&message_id).await {
+                            warn!("failed to delete feishu pending card after text command: {err:#}");
+                        }
+                    }
+                }
                 self.clear_stream_state(&message.conversation_id).await;
                 let _ = self
                     .send_text_message(&message.conversation_id, &message.text)
                     .await?;
                 Ok(())
             }
+            OutboundMessageKind::PendingInteraction => {
+                let summary = message
+                    .pending_interaction
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing pending interaction payload for feishu card"))?;
+                info!(
+                    conversation_id = message.conversation_id,
+                    token = %summary.token,
+                    "sending feishu pending interaction card"
+                );
+                self.upsert_stream_message(
+                    &message.conversation_id,
+                    pending_interaction_status_text(summary),
+                    true,
+                )
+                .await?;
+                let message_id = self
+                    .send_pending_interaction_card(&message.conversation_id, summary)
+                    .await?;
+                self.pending_card_messages
+                    .lock()
+                    .await
+                    .insert(summary.token.clone(), message_id);
+                debug!(
+                    token = %summary.token,
+                    "stored feishu pending card message id for later patch"
+                );
+                Ok(())
+            }
         }
+    }
+
+    fn card_action_to_inbound(&self, event: &EventEnvelope) -> Result<Option<CardActionInbound>> {
+        let Some(action) = event.event.action.as_ref() else {
+            return Ok(None);
+        };
+
+        let Some(value) = action.value.as_ref() else {
+            return Ok(None);
+        };
+
+        let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        if kind != "codex_pending" {
+            return Ok(None);
+        }
+
+        let conversation_id = value
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| event.event.context.as_ref().and_then(|context| context.open_chat_id.clone()))
+            .ok_or_else(|| anyhow!("feishu card action missing conversation id"))?;
+        let text = value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("feishu card action missing command"))?
+            .to_owned();
+
+        Ok(Some(CardActionInbound {
+            message: InboundMessage {
+                adapter: self.name().to_owned(),
+                conversation_id,
+                sender_id: event
+                    .event
+                    .operator
+                    .as_ref()
+                    .and_then(|operator| {
+                        Some(
+                            if !operator.open_id.is_empty() {
+                                operator.open_id.clone()
+                            } else {
+                                operator
+                                    .user_id
+                                    .clone()
+                                    .or_else(|| operator.tenant_key.clone())?
+                            },
+                        )
+                    }),
+                text,
+            },
+            selected_label: value
+                .get("selected_label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            token: value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            open_message_id: event
+                .event
+                .context
+                .as_ref()
+                .and_then(|context| context.open_message_id.clone()),
+            delete_after_action: value
+                .get("delete_after_action")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        }))
     }
 
     async fn upsert_stream_message(
@@ -403,24 +568,64 @@ impl FeishuAdapter {
             .await
             .context("failed to send feishu text message")?;
 
-        let status = response.status();
-        let body: FeishuApiResponse<CreateOrUpdateMessageData> = response
-            .json()
-            .await
-            .context("failed to parse feishu send-message response")?;
+        let (status, body, raw_body) =
+            parse_feishu_api_response::<CreateOrUpdateMessageData>(response, "send-message")
+                .await?;
 
         if !status.is_success() || body.code != 0 {
             bail!(
-                "feishu send-message failed with http {} and code {}: {}",
+                "feishu send-message failed with http {} and code {}: {} (body: {})",
                 status,
                 body.code,
-                body.msg.unwrap_or_else(|| "unknown error".to_owned())
+                body.msg.unwrap_or_else(|| "unknown error".to_owned()),
+                raw_body
             );
         }
 
         body.data
             .and_then(|data| data.message_id)
             .ok_or_else(|| anyhow!("feishu send-message response missing message_id"))
+    }
+
+    async fn send_pending_interaction_card(
+        &self,
+        conversation_id: &str,
+        summary: &PendingInteractionSummary,
+    ) -> Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let card = build_pending_interaction_card(conversation_id, summary);
+        let payload = serde_json::json!({
+            "receive_id": conversation_id,
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&card)?,
+        });
+
+        let response = self
+            .http
+            .post(format!("{}{}", self.base_url, FEISHU_SEND_MESSAGE_PATH))
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send feishu interactive card message")?;
+
+        let (status, body, raw_body) =
+            parse_feishu_api_response::<CreateOrUpdateMessageData>(response, "send-card")
+                .await?;
+
+        if !status.is_success() || body.code != 0 {
+            bail!(
+                "feishu send-card failed with http {} and code {}: {} (body: {})",
+                status,
+                body.code,
+                body.msg.unwrap_or_else(|| "unknown error".to_owned()),
+                raw_body
+            );
+        }
+
+        body.data
+            .and_then(|data| data.message_id)
+            .ok_or_else(|| anyhow!("feishu send-card response missing message_id"))
     }
 
     async fn update_text_message(&self, message_id: &str, text: &str) -> Result<()> {
@@ -443,18 +648,49 @@ impl FeishuAdapter {
             .await
             .context("failed to update feishu text message")?;
 
-        let status = response.status();
-        let body: FeishuApiResponse<CreateOrUpdateMessageData> = response
-            .json()
-            .await
-            .context("failed to parse feishu update-message response")?;
+        let (status, body, raw_body) =
+            parse_feishu_api_response::<CreateOrUpdateMessageData>(response, "update-message")
+                .await?;
 
         if !status.is_success() || body.code != 0 {
             bail!(
-                "feishu update-message failed with http {} and code {}: {}",
+                "feishu update-message failed with http {} and code {}: {} (body: {})",
                 status,
                 body.code,
-                body.msg.unwrap_or_else(|| "unknown error".to_owned())
+                body.msg.unwrap_or_else(|| "unknown error".to_owned()),
+                raw_body
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn delete_message(&self, message_id: &str) -> Result<()> {
+        info!(message_id, "deleting feishu message");
+        let token = self.get_tenant_access_token().await?;
+
+        let response = self
+            .http
+            .delete(format!(
+                "{}{}/{}",
+                self.base_url, FEISHU_UPDATE_MESSAGE_PATH_PREFIX, message_id
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("failed to delete feishu message")?;
+
+        let (status, body, raw_body) =
+            parse_feishu_api_response::<CreateOrUpdateMessageData>(response, "delete-message")
+                .await?;
+
+        if !status.is_success() || body.code != 0 {
+            bail!(
+                "feishu delete-message failed with http {} and code {}: {} (body: {})",
+                status,
+                body.code,
+                body.msg.unwrap_or_else(|| "unknown error".to_owned()),
+                raw_body
             );
         }
 
@@ -537,6 +773,115 @@ impl ImAdapter for FeishuAdapter {
     }
 }
 
+async fn connect_feishu_websocket(
+    endpoint_url: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    if let Some(proxy_url) = resolve_proxy_for_ws_url(endpoint_url)? {
+        info!(proxy = %proxy_url, "connecting to feishu websocket through proxy");
+        return connect_websocket_via_http_proxy(endpoint_url, &proxy_url).await;
+    }
+
+    let (socket, _) = connect_async(endpoint_url).await?;
+    Ok(socket)
+}
+
+async fn connect_websocket_via_http_proxy(
+    endpoint_url: &str,
+    proxy_url: &Url,
+) -> Result<tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    if proxy_url.scheme() != "http" {
+        bail!(
+            "unsupported proxy scheme `{}` for feishu websocket; only http proxies are supported",
+            proxy_url.scheme()
+        );
+    }
+    if !proxy_url.username().is_empty() || proxy_url.password().is_some() {
+        bail!("proxy authentication is not supported for feishu websocket yet");
+    }
+
+    let endpoint = Url::parse(endpoint_url)
+        .with_context(|| format!("invalid feishu websocket url `{endpoint_url}`"))?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| anyhow!("feishu websocket url missing host"))?;
+    let port = endpoint
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("feishu websocket url missing port"))?;
+
+    let proxy_host = proxy_url
+        .host_str()
+        .ok_or_else(|| anyhow!("proxy url missing host"))?;
+    let proxy_port = proxy_url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("proxy url missing port"))?;
+
+    let mut stream = TcpStream::connect((proxy_host, proxy_port))
+        .await
+        .with_context(|| format!("failed to connect to proxy {proxy_host}:{proxy_port}"))?;
+
+    let connect_request = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream
+        .write_all(connect_request.as_bytes())
+        .await
+        .context("failed to send CONNECT request to proxy")?;
+
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .context("failed to read proxy CONNECT response")?;
+        if read == 0 {
+            bail!("proxy closed the connection before CONNECT completed");
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > 16 * 1024 {
+            bail!("proxy CONNECT response headers are too large");
+        }
+    }
+
+    let response_text = String::from_utf8_lossy(&response);
+    if !response_text.starts_with("HTTP/1.1 200") && !response_text.starts_with("HTTP/1.0 200") {
+        bail!("proxy CONNECT failed: {}", response_text.lines().next().unwrap_or("unknown response"));
+    }
+
+    let (socket, _) = client_async_tls(endpoint_url, stream)
+        .await
+        .context("failed to complete websocket handshake through proxy")?;
+    Ok(socket)
+}
+
+fn resolve_proxy_for_ws_url(endpoint_url: &str) -> Result<Option<Url>> {
+    let endpoint = Url::parse(endpoint_url)
+        .with_context(|| format!("invalid feishu websocket url `{endpoint_url}`"))?;
+    let scheme = endpoint.scheme();
+
+    let candidates = match scheme {
+        "wss" => ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].as_slice(),
+        "ws" => ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"].as_slice(),
+        _ => return Ok(None),
+    };
+
+    for key in candidates {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Url::parse(trimmed)
+                    .map(Some)
+                    .with_context(|| format!("invalid proxy url `{trimmed}` from env var `{key}`"));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn resolve_secret_env(
     field_name: &str,
     env_name: Option<String>,
@@ -552,6 +897,444 @@ fn resolve_secret_env(
     }
 
     bail!("env var `{env_name}` for feishu {field_name} is empty")
+}
+
+async fn parse_feishu_api_response<T>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<(reqwest::StatusCode, FeishuApiResponse<T>, String)>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let raw_body = response
+        .text()
+        .await
+        .with_context(|| format!("failed to read feishu {operation} response body"))?;
+    debug!(operation, status = %status, body = %raw_body, "received feishu api response");
+    let body = serde_json::from_str::<FeishuApiResponse<T>>(&raw_body).with_context(|| {
+        format!("failed to parse feishu {operation} response body as json: {raw_body}")
+    })?;
+    Ok((status, body, raw_body))
+}
+
+fn pending_interaction_status_text(summary: &PendingInteractionSummary) -> &'static str {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { .. }
+        | PendingInteractionKind::FileChangeApproval
+        | PendingInteractionKind::PermissionsApproval { .. } => {
+            "Codex is waiting for your approval in the card below..."
+        }
+        PendingInteractionKind::UserInputRequest { .. } => {
+            "Codex is waiting for your reply in the card below..."
+        }
+    }
+}
+
+fn build_pending_interaction_card(
+    conversation_id: &str,
+    summary: &PendingInteractionSummary,
+) -> serde_json::Value {
+    let (title, template) = pending_card_header_v2(summary);
+    let markdown = pending_card_markdown_v2(summary);
+    let mut elements = vec![serde_json::json!({
+        "tag": "markdown",
+        "content": markdown,
+    })];
+
+    for actions in pending_card_action_sections_v2(conversation_id, summary) {
+        if !actions.is_empty() {
+            elements.push(serde_json::json!({
+                "tag": "action",
+                "layout": "flow",
+                "actions": actions,
+            }));
+        }
+    }
+
+    serde_json::json!({
+        "config": {
+            "wide_screen_mode": true,
+            "enable_forward": true,
+            "update_multi": true,
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": title,
+            },
+            "template": template,
+        },
+        "elements": elements,
+    })
+}
+
+fn pending_card_header_v2(summary: &PendingInteractionSummary) -> (&'static str, &'static str) {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { .. } => ("Codex Command Approval", "orange"),
+        PendingInteractionKind::FileChangeApproval => ("Codex File Change Approval", "red"),
+        PendingInteractionKind::PermissionsApproval { .. } => {
+            ("Codex Permissions Approval", "orange")
+        }
+        PendingInteractionKind::UserInputRequest { .. } => ("Codex Needs Your Choice", "blue"),
+    }
+}
+
+fn pending_card_markdown_v2(summary: &PendingInteractionSummary) -> String {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { command, reason, .. } => {
+            let mut lines = vec![
+                "Codex wants to run this command:".to_owned(),
+                "```bash".to_owned(),
+                command
+                    .as_deref()
+                    .unwrap_or("(command not provided)")
+                    .to_owned(),
+                "```".to_owned(),
+            ];
+            if let Some(reason) = reason.as_deref().filter(|text| !text.trim().is_empty()) {
+                lines.push(String::new());
+                lines.push(reason.to_owned());
+            }
+            lines.push(String::new());
+            lines.push("Reply with `/approve` if this is the only pending item. Otherwise run `/pending` and answer by number.".to_owned());
+            lines.join("\n")
+        }
+        PendingInteractionKind::FileChangeApproval => [
+            "Codex wants to make file changes.",
+            "",
+            "Reply with `/approve` if this is the only pending item. Otherwise run `/pending` and answer by number.",
+        ]
+        .join("\n"),
+        PendingInteractionKind::PermissionsApproval { permissions, reason } => {
+            let mut lines = vec![
+                "Codex wants additional permissions:".to_owned(),
+                "```json".to_owned(),
+                permissions.to_string(),
+                "```".to_owned(),
+            ];
+            if let Some(reason) = reason.as_deref().filter(|text| !text.trim().is_empty()) {
+                lines.push(String::new());
+                lines.push(reason.to_owned());
+            }
+            lines.push(String::new());
+            lines.push("Reply with `/approve` if this is the only pending item. Otherwise run `/pending` and answer by number.".to_owned());
+            lines.join("\n")
+        }
+        PendingInteractionKind::UserInputRequest { questions } => {
+            let mut lines = Vec::new();
+            for (index, question) in questions.iter().enumerate() {
+                let header = question
+                    .get("header")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Question");
+                let body = question
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(missing question text)");
+                lines.push(format!("**{}. {}**", index + 1, header));
+                lines.push(body.to_owned());
+                if let Some(options) = question
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for (i, option) in options.iter().enumerate() {
+                        if let Some(label) = option.get("label").and_then(serde_json::Value::as_str)
+                        {
+                            lines.push(format!("{}. {}", i + 1, label));
+                        }
+                    }
+                }
+                lines.push(String::new());
+            }
+            if questions
+                .iter()
+                .all(|question| question.get("options").and_then(serde_json::Value::as_array).is_some())
+            {
+                lines.push("Choose from the buttons below. Use `Other` if you want to type your own answer.".to_owned());
+            } else if questions.len() == 1 {
+                lines.push(
+                    "Reply with `/reply <your answer>` if this is the only pending item. Otherwise run `/pending` and answer by number."
+                        .to_owned(),
+                );
+            } else {
+                lines.push(
+                    "Reply with `/reply {\"question_id\": [\"answer\"]}` if this is the only pending item. Otherwise run `/pending` and answer by number."
+                        .to_owned(),
+                );
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+fn pending_card_action_sections_v2(
+    conversation_id: &str,
+    summary: &PendingInteractionSummary,
+) -> Vec<Vec<serde_json::Value>> {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { .. }
+        | PendingInteractionKind::FileChangeApproval
+        | PendingInteractionKind::PermissionsApproval { .. } => vec![vec![
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/approve {}", summary.token),
+                "Approve",
+                "primary",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/approve-session {}", summary.token),
+                "Approve for session",
+                "default",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/deny {}", summary.token),
+                "Deny",
+                "danger",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/cancel {}", summary.token),
+                "Cancel",
+                "default",
+            ),
+        ]],
+        PendingInteractionKind::UserInputRequest { questions } => {
+            let mut sections = Vec::new();
+
+            for question in questions {
+                let Some(question_id) = question.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let Some(options) = question
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+
+                let buttons = options
+                    .iter()
+                    .filter_map(|option| option.get("label").and_then(serde_json::Value::as_str))
+                    .map(|label| {
+                        let command = if questions.len() == 1 {
+                            format!("/reply {} {}", summary.token, label)
+                        } else {
+                            let answer = serde_json::json!({
+                                question_id: [label]
+                            });
+                            format!("/reply {} {}", summary.token, answer)
+                        };
+                        pending_card_button(
+                            conversation_id,
+                            &summary.token,
+                            command,
+                            label,
+                            "primary",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                if buttons.is_empty() {
+                    continue;
+                }
+
+                for chunk in buttons.chunks(5) {
+                    sections.push(chunk.to_vec());
+                }
+            }
+
+            if questions.len() == 1
+                && questions[0]
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some()
+            {
+                sections.push(vec![pending_card_button_with_behavior(
+                    conversation_id,
+                    &summary.token,
+                    format!("/reply-other {}", summary.token),
+                    "Other",
+                    "default",
+                    false,
+                )]);
+            }
+
+            sections
+        }
+    }
+}
+
+fn pending_card_header(summary: &PendingInteractionSummary) -> (&'static str, &'static str) {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { .. } => ("Codex 命令审批", "orange"),
+        PendingInteractionKind::FileChangeApproval => ("Codex 文件变更审批", "red"),
+        PendingInteractionKind::PermissionsApproval { .. } => ("Codex 权限审批", "orange"),
+        PendingInteractionKind::UserInputRequest { .. } => ("Codex 需要你选择", "blue"),
+    }
+}
+
+fn pending_card_markdown(summary: &PendingInteractionSummary) -> String {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { command, cwd, reason } => format!(
+            "**Token:** `{}`\n**命令:** `{}`\n**目录:** `{}`\n**原因:** {}\n\n可以直接点下面的按钮，也可以继续用文本命令。",
+            summary.token,
+            command.as_deref().unwrap_or("(not provided)"),
+            cwd.as_deref().unwrap_or("(not provided)"),
+            reason.as_deref().unwrap_or("(not provided)")
+        ),
+        PendingInteractionKind::FileChangeApproval => format!(
+            "**Token:** `{}`\nCodex 请求执行文件变更。\n\n可以直接点下面的按钮，也可以继续用文本命令。",
+            summary.token
+        ),
+        PendingInteractionKind::PermissionsApproval { permissions, reason } => format!(
+            "**Token:** `{}`\n**权限请求:** `{}`\n**原因:** {}\n\n可以直接点下面的按钮，也可以继续用文本命令。",
+            summary.token,
+            permissions,
+            reason.as_deref().unwrap_or("(not provided)")
+        ),
+        PendingInteractionKind::UserInputRequest { questions } => {
+            let mut lines = vec![format!("**Token:** `{}`", summary.token)];
+            for (index, question) in questions.iter().enumerate() {
+                let header = question
+                    .get("header")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("问题");
+                let body = question
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(missing question text)");
+                lines.push(format!("**{}. {}**", index + 1, header));
+                lines.push(body.to_owned());
+                if let Some(options) = question.get("options").and_then(serde_json::Value::as_array) {
+                    let option_lines = options
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, option)| {
+                            option
+                                .get("label")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|label| format!("{}. {}", i + 1, label))
+                        })
+                        .collect::<Vec<_>>();
+                    if !option_lines.is_empty() {
+                        lines.push(String::new());
+                        lines.extend(option_lines);
+                    }
+                }
+                lines.push(String::new());
+            }
+            lines.push("可以直接点按钮，也可以继续用 `/reply` 文本回复。".to_owned());
+            lines.join("\n")
+        }
+    }
+}
+
+fn pending_card_actions(
+    conversation_id: &str,
+    summary: &PendingInteractionSummary,
+) -> Vec<serde_json::Value> {
+    match &summary.kind {
+        PendingInteractionKind::CommandApproval { .. }
+        | PendingInteractionKind::FileChangeApproval
+        | PendingInteractionKind::PermissionsApproval { .. } => vec![
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/approve {}", summary.token),
+                "批准",
+                "primary",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/approve-session {}", summary.token),
+                "本会话批准",
+                "default",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/deny {}", summary.token),
+                "拒绝",
+                "danger",
+            ),
+            pending_card_button(
+                conversation_id,
+                &summary.token,
+                format!("/cancel {}", summary.token),
+                "取消",
+                "default",
+            ),
+        ],
+        PendingInteractionKind::UserInputRequest { questions } => {
+            if questions.len() != 1 {
+                return Vec::new();
+            }
+            let Some(options) = questions[0].get("options").and_then(serde_json::Value::as_array) else {
+                return Vec::new();
+            };
+            if options.len() > 5 {
+                return Vec::new();
+            }
+
+            options
+                .iter()
+                .filter_map(|option| option.get("label").and_then(serde_json::Value::as_str))
+                .map(|label| {
+                    pending_card_button(
+                        conversation_id,
+                        &summary.token,
+                        format!("/reply {} {}", summary.token, label),
+                        label,
+                        "primary",
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+fn pending_card_button(
+    conversation_id: &str,
+    token: &str,
+    command: String,
+    label: &str,
+    button_type: &str,
+) -> serde_json::Value {
+    pending_card_button_with_behavior(conversation_id, token, command, label, button_type, true)
+}
+
+fn pending_card_button_with_behavior(
+    conversation_id: &str,
+    token: &str,
+    command: String,
+    label: &str,
+    button_type: &str,
+    delete_after_action: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "button",
+        "text": {
+            "tag": "plain_text",
+            "content": label,
+        },
+        "type": button_type,
+        "value": {
+            "kind": "codex_pending",
+            "conversation_id": conversation_id,
+            "token": token,
+            "command": command,
+            "selected_label": label,
+            "delete_after_action": delete_after_action,
+        }
+    })
 }
 
 fn extract_service_id(url: &str) -> Option<i32> {
@@ -623,6 +1406,14 @@ struct ConversationStreamState {
     draft_message_id: Option<String>,
 }
 
+struct CardActionInbound {
+    message: InboundMessage,
+    selected_label: Option<String>,
+    token: Option<String>,
+    open_message_id: Option<String>,
+    delete_after_action: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct EndpointResponse {
     code: i32,
@@ -659,6 +1450,9 @@ struct EventHeader {
 struct EventBody {
     sender: Option<EventSender>,
     message: Option<EventMessage>,
+    operator: Option<CardActionOperator>,
+    action: Option<CardAction>,
+    context: Option<CardActionContext>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +1473,24 @@ struct EventMessage {
     thread_id: Option<String>,
     message_type: Option<String>,
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardActionOperator {
+    tenant_key: Option<String>,
+    user_id: Option<String>,
+    open_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardAction {
+    value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardActionContext {
+    open_message_id: Option<String>,
+    open_chat_id: Option<String>,
 }
 
 impl EventMessage {
@@ -723,6 +1535,10 @@ struct ResponseEnvelope {
     code: i32,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toast: Option<ResponseToast>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    card: Option<ResponseCard>,
 }
 
 impl ResponseEnvelope {
@@ -730,8 +1546,51 @@ impl ResponseEnvelope {
         Self {
             code: 200,
             headers: HashMap::new(),
+            toast: None,
+            card: None,
         }
     }
+
+    fn with_success_toast(content: impl Into<String>) -> Self {
+        Self {
+            code: 200,
+            headers: HashMap::new(),
+            toast: Some(ResponseToast {
+                type_: "success".to_owned(),
+                content: content.into(),
+            }),
+            card: None,
+        }
+    }
+
+    fn with_success_card(content: impl Into<String>, card: serde_json::Value) -> Self {
+        Self {
+            code: 200,
+            headers: HashMap::new(),
+            toast: Some(ResponseToast {
+                type_: "success".to_owned(),
+                content: content.into(),
+            }),
+            card: Some(ResponseCard {
+                type_: "card_json".to_owned(),
+                data: card,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseToast {
+    #[serde(rename = "type")]
+    type_: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseCard {
+    #[serde(rename = "type")]
+    type_: String,
+    data: serde_json::Value,
 }
 
 #[derive(Clone, PartialEq, Message)]

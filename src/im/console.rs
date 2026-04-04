@@ -92,6 +92,7 @@ impl ImAdapter for ConsoleAdapter {
                 OutboundMessageKind::Agent => "codex",
                 OutboundMessageKind::Notice => "codex-notice",
                 OutboundMessageKind::CommandResult => "codex-command",
+                OutboundMessageKind::PendingInteraction => "codex-pending",
             }
         };
         println!(

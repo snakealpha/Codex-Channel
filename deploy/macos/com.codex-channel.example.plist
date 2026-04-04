@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex-channel</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/your-name/.cargo/bin/codex-channel</string>
+    <string>--config</string>
+    <string>/Users/your-name/.config/codex-channel/feishu.production.toml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/your-name/workspaces/openclaw</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FEISHU_APP_ID</key>
+    <string>cli_xxx</string>
+    <key>FEISHU_APP_SECRET</key>
+    <string>replace-me</string>
+    <key>HTTP_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/your-name/Library/Logs/codex-channel.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/your-name/Library/Logs/codex-channel.err.log</string>
+</dict>
+</plist>

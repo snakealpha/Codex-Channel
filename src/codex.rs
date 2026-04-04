@@ -9,13 +9,16 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
+use crate::codex_app_server::AppServerClient;
 use crate::config::CodexConfig;
+use crate::model::{CollaborationModePreset, PendingInteractionSummary};
 
 #[derive(Debug, Clone)]
 pub struct CodexRequest {
     pub session_id: Option<String>,
     pub prompt: String,
     pub working_directory: PathBuf,
+    pub collaboration_mode: Option<CollaborationModePreset>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,15 +30,38 @@ pub struct CodexTurnSummary {
 pub enum CodexStreamEvent {
     AgentMessage { text: String, is_partial: bool },
     Notice(String),
+    PendingInteraction(PendingInteractionSummary),
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingInteractionAction {
+    Approve,
+    ApproveForSession,
+    Deny,
+    Cancel,
+    ReplyText(String),
+    ReplyJson(Value),
 }
 
 pub struct CodexCli {
     config: CodexConfig,
+    backend: CodexBackend,
+}
+
+enum CodexBackend {
+    Exec,
+    AppServer(AppServerClient),
 }
 
 impl CodexCli {
     pub fn new(config: CodexConfig) -> Self {
-        Self { config }
+        let backend = if config.use_app_server {
+            CodexBackend::AppServer(AppServerClient::new(config.clone()))
+        } else {
+            CodexBackend::Exec
+        };
+
+        Self { config, backend }
     }
 
     pub async fn run_turn<F, Fut>(
@@ -47,9 +73,14 @@ impl CodexCli {
         F: FnMut(CodexStreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let mut command = self.build_exec_command(&request)?;
-        self.run_command(&mut command, Some(request.prompt), &mut on_event)
-            .await
+        match &self.backend {
+            CodexBackend::Exec => {
+                let mut command = self.build_exec_command(&request)?;
+                self.run_command(&mut command, Some(request.prompt), &mut on_event)
+                    .await
+            }
+            CodexBackend::AppServer(client) => client.run_turn(request, on_event).await,
+        }
     }
 
     pub async fn run_review<F, Fut>(&self, working_directory: PathBuf, mut on_event: F) -> Result<()>
@@ -57,9 +88,39 @@ impl CodexCli {
         F: FnMut(CodexStreamEvent) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        if matches!(self.backend, CodexBackend::AppServer(_)) {
+            bail!("review is not supported in app-server mode yet");
+        }
         let mut command = self.build_review_command(&working_directory)?;
         let _ = self.run_command(&mut command, None, &mut on_event).await?;
         Ok(())
+    }
+
+    pub async fn respond_to_pending(
+        &self,
+        token: &str,
+        action: PendingInteractionAction,
+    ) -> Result<()> {
+        match &self.backend {
+            CodexBackend::Exec => {
+                bail!("pending approvals are only available in app-server mode")
+            }
+            CodexBackend::AppServer(client) => client.respond_to_pending(token, action).await,
+        }
+    }
+
+    pub async fn list_pending_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<PendingInteractionSummary>> {
+        match &self.backend {
+            CodexBackend::Exec => Ok(Vec::new()),
+            CodexBackend::AppServer(client) => client.list_pending_for_thread(thread_id).await,
+        }
+    }
+
+    pub fn supports_collaboration_mode(&self) -> bool {
+        matches!(self.backend, CodexBackend::AppServer(_))
     }
 
     async fn run_command<F, Fut>(
@@ -191,6 +252,7 @@ impl CodexCli {
 
         command.current_dir(&request.working_directory);
         self.apply_proxy_environment(&mut command);
+        self.apply_global_codex_options(&mut command);
         command.arg("exec");
 
         match &request.session_id {
@@ -227,10 +289,6 @@ impl CodexCli {
                     command.arg("--model");
                     command.arg(model);
                 }
-                if let Some(profile) = &self.config.profile {
-                    command.arg("--profile");
-                    command.arg(profile);
-                }
                 for dir in &self.config.additional_writable_dirs {
                     command.arg("--add-dir");
                     command.arg(dir);
@@ -263,6 +321,7 @@ impl CodexCli {
 
         command.current_dir(working_directory);
         self.apply_proxy_environment(&mut command);
+        self.apply_global_codex_options(&mut command);
         command.arg("exec");
         command.arg("review");
         command.arg("--json");
@@ -300,9 +359,30 @@ impl CodexCli {
         apply_optional_env(command, "all_proxy", self.config.all_proxy.as_deref());
         apply_optional_env(command, "no_proxy", self.config.no_proxy.as_deref());
     }
+
+    fn apply_global_codex_options(&self, command: &mut Command) {
+        if let Some(sandbox) = &self.config.sandbox {
+            command.arg("--sandbox");
+            command.arg(sandbox);
+        }
+
+        if let Some(approval) = &self.config.ask_for_approval {
+            command.arg("--ask-for-approval");
+            command.arg(approval);
+        }
+
+        if self.config.search {
+            command.arg("--search");
+        }
+
+        if let Some(profile) = &self.config.profile {
+            command.arg("--profile");
+            command.arg(profile);
+        }
+    }
 }
 
-fn apply_optional_env(command: &mut Command, key: &str, value: Option<&str>) {
+pub(crate) fn apply_optional_env(command: &mut Command, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         if !value.trim().is_empty() {
             command.env(key, value);

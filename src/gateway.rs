@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,10 +9,13 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
-use crate::codex::{CodexCli, CodexRequest, CodexStreamEvent, CodexTurnSummary};
+use crate::codex::{
+    CodexCli, CodexRequest, CodexStreamEvent, CodexTurnSummary, PendingInteractionAction,
+};
 use crate::im::ImAdapter;
 use crate::model::{
-    conversation_key, ConversationState, InboundMessage, OutboundMessage, OutboundMessageKind,
+    conversation_key, CollaborationModePreset, ConversationState, InboundMessage,
+    OutboundMessage, OutboundMessageKind, PendingInteractionKind, PendingInteractionSummary,
     ThreadRecord,
 };
 use crate::session_store::SessionStore;
@@ -23,6 +26,7 @@ pub struct Gateway {
     session_store: Arc<SessionStore>,
     default_working_directory: PathBuf,
     conversation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    active_conversations: Mutex<HashSet<String>>,
 }
 
 impl Gateway {
@@ -38,6 +42,7 @@ impl Gateway {
             session_store,
             default_working_directory,
             conversation_locks: Mutex::new(HashMap::new()),
+            active_conversations: Mutex::new(HashSet::new()),
         }
     }
 
@@ -68,6 +73,8 @@ impl Gateway {
                                             text: format!("Codex failed: {err}"),
                                             is_partial: false,
                                             kind: OutboundMessageKind::Notice,
+                                            pending_interaction: None,
+                                            dismiss_pending_token: None,
                                         })
                                         .await;
                                 }
@@ -111,6 +118,14 @@ impl Gateway {
 
     async fn handle_message(self: Arc<Self>, inbound: InboundMessage) -> Result<()> {
         let key = conversation_key(&inbound.adapter, &inbound.conversation_id);
+        let trimmed_text = inbound.text.trim();
+
+        if let Some(command) = parse_interaction_command(trimmed_text) {
+            return self
+                .handle_interaction_command(command, &key, &inbound.adapter, &inbound.conversation_id)
+                .await;
+        }
+
         let lock = self.conversation_lock(&key).await;
         let _guard = lock.lock().await;
 
@@ -124,17 +139,35 @@ impl Gateway {
         let adapter_name = inbound.adapter.clone();
         let conversation_id = inbound.conversation_id.clone();
         let adapter = self.adapter.clone();
-        let trimmed_text = inbound.text.trim();
 
         let mut state = self.load_state(&key).await;
 
         if let Some(command) = parse_management_command(trimmed_text) {
+            if self.is_conversation_active(&key).await {
+                self.send_notice(
+                    &adapter_name,
+                    &conversation_id,
+                    "Codex is already busy in this conversation. Wait for the current turn to finish, or respond to the pending request with `/approve`, `/deny`, `/cancel`, `/reply`, or `/pending`.".to_owned(),
+                )
+                .await?;
+                return Ok(());
+            }
             self.handle_management_command(
                 command,
                 &key,
                 &mut state,
                 &adapter_name,
                 &conversation_id,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if self.is_conversation_active(&key).await {
+            self.send_notice(
+                &adapter_name,
+                &conversation_id,
+                "Codex is already working in this conversation. Wait for the current turn to finish, or answer the pending request with `/approve`, `/deny`, `/cancel`, `/reply`, or `/pending`.".to_owned(),
             )
             .await?;
             return Ok(());
@@ -149,6 +182,8 @@ impl Gateway {
                         .to_owned(),
                     is_partial: true,
                     kind: OutboundMessageKind::Status,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
                 })
                 .await?;
 
@@ -161,6 +196,8 @@ impl Gateway {
                         .to_owned(),
                     is_partial: false,
                     kind: OutboundMessageKind::Notice,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
                 })
                 .await?;
 
@@ -173,6 +210,8 @@ impl Gateway {
                         .to_owned(),
                     is_partial: false,
                     kind: OutboundMessageKind::Agent,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
                 })
                 .await?;
 
@@ -185,6 +224,7 @@ impl Gateway {
             .ok_or_else(|| anyhow!("no current thread is selected"))?;
         let working_directory =
             effective_working_directory(&current_thread, &self.default_working_directory);
+        drop(_guard);
 
         if trimmed_text.starts_with("/review") {
             self.send_notice(
@@ -209,58 +249,214 @@ impl Gateway {
                     ),
                     is_partial: true,
                     kind: OutboundMessageKind::Status,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
                 })
                 .await?;
+            self.mark_conversation_active(&key).await;
 
             let prompt = inbound.text;
-            let summary = match run_turn_once(
-                self.codex.clone(),
-                current_thread.codex_thread_id.clone(),
-                prompt.clone(),
-                working_directory.clone(),
-                adapter.clone(),
-                adapter_name.clone(),
-                conversation_id.clone(),
-            )
-            .await
-            {
-                Ok(summary) => summary,
-                Err(err)
-                    if should_retry_with_fresh_session(
-                        current_thread.codex_thread_id.as_ref(),
-                        &err,
-                    ) =>
+            let turn_result = async {
+                match run_turn_once(
+                    self.codex.clone(),
+                    current_thread.codex_thread_id.clone(),
+                    prompt.clone(),
+                    working_directory.clone(),
+                    current_thread.collaboration_mode.clone(),
+                    adapter.clone(),
+                    adapter_name.clone(),
+                    conversation_id.clone(),
+                )
+                .await
                 {
-                    adapter
-                        .send(OutboundMessage {
-                            adapter: adapter_name.clone(),
-                            conversation_id: conversation_id.clone(),
-                            text: "Previous Codex session stalled. Starting a fresh session..."
-                                .to_owned(),
-                            is_partial: false,
-                            kind: OutboundMessageKind::Notice,
-                        })
-                        .await?;
+                    Ok(summary) => Ok(summary),
+                    Err(err)
+                        if should_retry_with_fresh_session(
+                            current_thread.codex_thread_id.as_ref(),
+                            &err,
+                        ) =>
+                    {
+                        adapter
+                            .send(OutboundMessage {
+                                adapter: adapter_name.clone(),
+                                conversation_id: conversation_id.clone(),
+                                text:
+                                    "Previous Codex session stalled. Starting a fresh session..."
+                                        .to_owned(),
+                                is_partial: false,
+                                kind: OutboundMessageKind::Notice,
+                                pending_interaction: None,
+                                dismiss_pending_token: None,
+                            })
+                            .await?;
 
-                    run_turn_once(
-                        self.codex.clone(),
-                        None,
-                        prompt,
-                        working_directory,
-                        adapter.clone(),
-                        adapter_name.clone(),
-                        conversation_id.clone(),
-                    )
-                    .await?
+                        run_turn_once(
+                            self.codex.clone(),
+                            None,
+                            prompt,
+                            working_directory,
+                            current_thread.collaboration_mode.clone(),
+                            adapter.clone(),
+                            adapter_name.clone(),
+                            conversation_id.clone(),
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => return Err(err),
-            };
+            }
+            .await;
+            self.mark_conversation_inactive(&key).await;
+
+            let summary = turn_result?;
 
             if let Some(thread_id) = summary.thread_id {
                 if let Some(thread) = state.current_thread_record_mut() {
                     thread.codex_thread_id = Some(thread_id);
                 }
                 self.session_store.upsert(key, state).await?;
+            };
+        }
+
+        Ok(())
+    }
+
+    async fn handle_interaction_command(
+        &self,
+        command: InteractionCommand,
+        key: &str,
+        adapter_name: &str,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let state = self.load_state(key).await;
+        let current_thread = state
+            .current_thread_record()
+            .ok_or_else(|| anyhow!("no current thread is selected"))?;
+        let Some(thread_id) = current_thread.codex_thread_id.as_deref() else {
+            self.send_notice(
+                adapter_name,
+                conversation_id,
+                "The current thread does not have an active Codex thread id yet.".to_owned(),
+            )
+            .await?;
+            return Ok(());
+        };
+
+        match command {
+            InteractionCommand::Pending => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let text = format_pending_list(&pending);
+                self.send_notice(adapter_name, conversation_id, text).await?;
+            }
+            InteractionCommand::Approve(target) => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let token = summary.token.clone();
+                self.codex
+                    .respond_to_pending(&token, PendingInteractionAction::Approve)
+                    .await?;
+                self.send_command_result(
+                    adapter_name,
+                    conversation_id,
+                    format!("Approved Codex request `{token}`. Codex is continuing in this conversation."),
+                    Some(token),
+                )
+                .await?;
+            }
+            InteractionCommand::ApproveForSession(target) => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let token = summary.token.clone();
+                self.codex
+                    .respond_to_pending(&token, PendingInteractionAction::ApproveForSession)
+                    .await?;
+                self.send_command_result(
+                    adapter_name,
+                    conversation_id,
+                    format!("Approved Codex request `{token}` for the rest of the session. Codex is continuing in this conversation."),
+                    Some(token),
+                )
+                .await?;
+            }
+            InteractionCommand::Deny(target) => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let token = summary.token.clone();
+                self.codex
+                    .respond_to_pending(&token, PendingInteractionAction::Deny)
+                    .await?;
+                self.send_command_result(
+                    adapter_name,
+                    conversation_id,
+                    format!("Denied Codex request `{token}`."),
+                    Some(token),
+                )
+                .await?;
+            }
+            InteractionCommand::Cancel(target) => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let token = summary.token.clone();
+                self.codex
+                    .respond_to_pending(&token, PendingInteractionAction::Cancel)
+                    .await?;
+                self.send_command_result(
+                    adapter_name,
+                    conversation_id,
+                    format!("Cancelled Codex request `{token}`."),
+                    Some(token),
+                )
+                .await?;
+            }
+            InteractionCommand::ReplyOther(target) => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let ordinal = pending
+                    .iter()
+                    .position(|item| item.token == summary.token)
+                    .map(|index| index + 1);
+
+                let text = match &summary.kind {
+                    PendingInteractionKind::UserInputRequest { questions } if questions.len() == 1 => {
+                        if pending.len() == 1 {
+                            "Send your custom answer with `/reply <your answer>`.".to_owned()
+                        } else if let Some(ordinal) = ordinal {
+                            format!("Send your custom answer with `/reply {ordinal} <your answer>`.")
+                        } else {
+                            format!(
+                                "Send your custom answer with `/reply {} <your answer>`.",
+                                summary.token
+                            )
+                        }
+                    }
+                    PendingInteractionKind::UserInputRequest { .. } => {
+                        format!(
+                            "This request needs structured input. Reply with `/reply {} {{\"question_id\": [\"your answer\"]}}`.",
+                            summary.token
+                        )
+                    }
+                    _ => "This pending Codex request does not accept free-form input.".to_owned(),
+                };
+
+                self.send_notice(adapter_name, conversation_id, text).await?;
+            }
+            InteractionCommand::ReplyText { target, text } => {
+                let pending = self.codex.list_pending_for_thread(thread_id).await?;
+                let summary = resolve_pending_target(&pending, &target)?;
+                let token = summary.token.clone();
+                let action = if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    PendingInteractionAction::ReplyJson(value)
+                } else {
+                    PendingInteractionAction::ReplyText(text)
+                };
+                self.codex.respond_to_pending(&token, action).await?;
+                self.send_command_result(
+                    adapter_name,
+                    conversation_id,
+                    format!("Sent your response to Codex request `{token}`. Codex is continuing in this conversation."),
+                    Some(token),
+                )
+                .await?;
             }
         }
 
@@ -295,6 +491,9 @@ impl Gateway {
                         effective_working_directory(thread, &self.default_working_directory)
                     })
                     .unwrap_or_else(|| self.default_working_directory.clone());
+                let inherited_mode = state
+                    .current_thread_record()
+                    .and_then(|thread| thread.collaboration_mode.clone());
 
                 state.threads.insert(
                     alias.clone(),
@@ -302,6 +501,7 @@ impl Gateway {
                         alias: alias.clone(),
                         codex_thread_id: None,
                         working_directory: Some(inherited_directory.clone()),
+                        collaboration_mode: inherited_mode.clone(),
                     },
                 );
                 state.current_thread = alias.clone();
@@ -313,8 +513,12 @@ impl Gateway {
                     adapter_name,
                     conversation_id,
                     format!(
-                        "Created thread `{alias}` and switched to it.\nWorking directory: `{}`",
-                        inherited_directory.display()
+                        "Created thread `{alias}` and switched to it.\nWorking directory: `{}`\nMode: `{}`",
+                        inherited_directory.display(),
+                        inherited_mode
+                            .as_ref()
+                            .map(CollaborationModePreset::display_name)
+                            .unwrap_or("codex-default")
                     ),
                 )
                 .await?;
@@ -339,8 +543,9 @@ impl Gateway {
                     adapter_name,
                     conversation_id,
                     format!(
-                        "Switched to thread `{alias}`.\nWorking directory: `{}`\nCodex session: {}",
+                        "Switched to thread `{alias}`.\nWorking directory: `{}`\nMode: `{}`\nCodex session: {}",
                         working_directory.display(),
+                        describe_thread_mode(thread),
                         thread
                             .codex_thread_id
                             .as_deref()
@@ -388,14 +593,65 @@ impl Gateway {
                     adapter_name,
                     conversation_id,
                     format!(
-                        "Current thread: `{}`\nWorking directory: `{}`\nCodex session: {}",
+                        "Current thread: `{}`\nWorking directory: `{}`\nMode: `{}`\nCodex session: {}",
                         thread.alias,
                         working_directory.display(),
+                        describe_thread_mode(thread),
                         thread
                             .codex_thread_id
                             .as_deref()
                             .map(short_session_id)
                             .unwrap_or("new")
+                    ),
+                )
+                .await?;
+            }
+            ManagementCommand::ShowMode => {
+                let thread = state
+                    .current_thread_record()
+                    .ok_or_else(|| anyhow!("no current thread is selected"))?;
+                let backend_note = if self.codex.supports_collaboration_mode() {
+                    "This mode will be sent to Codex on the next turn."
+                } else {
+                    "This gateway is not using app-server mode, so the setting is only stored locally."
+                };
+
+                self.send_notice(
+                    adapter_name,
+                    conversation_id,
+                    format!(
+                        "Current mode for thread `{}`: `{}`.\n{backend_note}",
+                        thread.alias,
+                        describe_thread_mode(thread)
+                    ),
+                )
+                .await?;
+            }
+            ManagementCommand::SetMode(mode) => {
+                let alias = {
+                    let thread = state
+                        .current_thread_record_mut()
+                        .ok_or_else(|| anyhow!("no current thread is selected"))?;
+                    thread.collaboration_mode = Some(mode.clone());
+                    thread.alias.clone()
+                };
+
+                self.session_store
+                    .upsert(key.to_owned(), state.clone())
+                    .await?;
+
+                let backend_note = if self.codex.supports_collaboration_mode() {
+                    "It will take effect on the next turn in this thread."
+                } else {
+                    "This gateway is not using app-server mode, so the setting is only stored locally."
+                };
+
+                self.send_notice(
+                    adapter_name,
+                    conversation_id,
+                    format!(
+                        "Switched thread `{alias}` to `{}` mode.\n{backend_note}",
+                        mode.display_name()
                     ),
                 )
                 .await?;
@@ -411,6 +667,17 @@ impl Gateway {
         conversation_id: &str,
         text: String,
     ) -> Result<()> {
+        self.send_command_result(adapter_name, conversation_id, text, None)
+            .await
+    }
+
+    async fn send_command_result(
+        &self,
+        adapter_name: &str,
+        conversation_id: &str,
+        text: String,
+        dismiss_pending_token: Option<String>,
+    ) -> Result<()> {
         self.adapter
             .send(OutboundMessage {
                 adapter: adapter_name.to_owned(),
@@ -418,6 +685,8 @@ impl Gateway {
                 text,
                 is_partial: false,
                 kind: OutboundMessageKind::CommandResult,
+                pending_interaction: None,
+                dismiss_pending_token,
             })
             .await
     }
@@ -430,6 +699,18 @@ impl Gateway {
             .unwrap_or_else(|| ConversationState::with_default_thread(self.default_working_directory.clone()));
         ensure_state_is_usable(&mut state, &self.default_working_directory);
         state
+    }
+
+    async fn is_conversation_active(&self, key: &str) -> bool {
+        self.active_conversations.lock().await.contains(key)
+    }
+
+    async fn mark_conversation_active(&self, key: &str) {
+        self.active_conversations.lock().await.insert(key.to_owned());
+    }
+
+    async fn mark_conversation_inactive(&self, key: &str) {
+        self.active_conversations.lock().await.remove(key);
     }
 
     async fn conversation_lock(&self, key: &str) -> Arc<Mutex<()>> {
@@ -448,11 +729,43 @@ enum ManagementCommand {
     UseThread(String),
     ChangeDirectory(String),
     PrintWorkingDirectory,
+    ShowMode,
+    SetMode(CollaborationModePreset),
+}
+
+#[derive(Debug, Clone)]
+enum InteractionCommand {
+    Pending,
+    Approve(PendingTarget),
+    ApproveForSession(PendingTarget),
+    Deny(PendingTarget),
+    Cancel(PendingTarget),
+    ReplyOther(PendingTarget),
+    ReplyText { target: PendingTarget, text: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingTarget {
+    Implicit,
+    Ordinal(usize),
+    Token(String),
+    Last,
 }
 
 fn parse_management_command(text: &str) -> Option<ManagementCommand> {
     if text == "/threads" {
         return Some(ManagementCommand::ListThreads);
+    }
+    if text == "/mode" {
+        return Some(ManagementCommand::ShowMode);
+    }
+    if let Some(raw_mode) = text.strip_prefix("/mode ") {
+        let raw_mode = raw_mode.trim().to_ascii_lowercase();
+        return match raw_mode.as_str() {
+            "plan" => Some(ManagementCommand::SetMode(CollaborationModePreset::Plan)),
+            "default" => Some(ManagementCommand::SetMode(CollaborationModePreset::Default)),
+            _ => None,
+        };
     }
     if text == "/pwd" || text == "/cwd" || text == "/thread current" {
         return Some(ManagementCommand::PrintWorkingDirectory);
@@ -479,6 +792,446 @@ fn parse_management_command(text: &str) -> Option<ManagementCommand> {
         }
     }
     None
+}
+
+fn parse_interaction_command(text: &str) -> Option<InteractionCommand> {
+    if text == "/pending" {
+        return Some(InteractionCommand::Pending);
+    }
+    if text == "/approve-session" {
+        return Some(InteractionCommand::ApproveForSession(PendingTarget::Implicit));
+    }
+    if let Some(target) = text.strip_prefix("/approve-session ") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Some(InteractionCommand::ApproveForSession(parse_pending_target(target)));
+        }
+    }
+    if text == "/approve" {
+        return Some(InteractionCommand::Approve(PendingTarget::Implicit));
+    }
+    if let Some(target) = text.strip_prefix("/approve ") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Some(InteractionCommand::Approve(parse_pending_target(target)));
+        }
+    }
+    if text == "/deny" {
+        return Some(InteractionCommand::Deny(PendingTarget::Implicit));
+    }
+    if let Some(target) = text.strip_prefix("/deny ") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Some(InteractionCommand::Deny(parse_pending_target(target)));
+        }
+    }
+    if text == "/cancel" {
+        return Some(InteractionCommand::Cancel(PendingTarget::Implicit));
+    }
+    if let Some(target) = text.strip_prefix("/cancel ") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Some(InteractionCommand::Cancel(parse_pending_target(target)));
+        }
+    }
+    if text == "/reply-other" {
+        return Some(InteractionCommand::ReplyOther(PendingTarget::Implicit));
+    }
+    if let Some(target) = text.strip_prefix("/reply-other ") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Some(InteractionCommand::ReplyOther(parse_pending_target(target)));
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/reply ") {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            if let Some((target, answer)) = split_pending_target_and_text(rest) {
+                return Some(InteractionCommand::ReplyText {
+                    target,
+                    text: answer.to_owned(),
+                });
+            }
+            return Some(InteractionCommand::ReplyText {
+                target: PendingTarget::Implicit,
+                text: rest.to_owned(),
+            });
+        }
+    }
+    None
+}
+
+fn split_pending_target_and_text(text: &str) -> Option<(PendingTarget, &str)> {
+    let first_whitespace = text.find(char::is_whitespace)?;
+    let target_text = text[..first_whitespace].trim();
+    let answer = text[first_whitespace..].trim();
+    if target_text.is_empty() || answer.is_empty() {
+        return None;
+    }
+    if is_explicit_pending_target(target_text) {
+        Some((parse_pending_target(target_text), answer))
+    } else {
+        None
+    }
+}
+
+fn is_explicit_pending_target(text: &str) -> bool {
+    let normalized = normalize_pending_target_text(text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized.eq_ignore_ascii_case("last")
+        || normalized.eq_ignore_ascii_case("latest")
+        || normalized.starts_with("req-")
+    {
+        return true;
+    }
+
+    if normalized.parse::<usize>().ok().filter(|index| *index > 0).is_some() {
+        return true;
+    }
+
+    parse_chinese_ordinal(normalized).is_some()
+}
+
+fn parse_pending_target(text: &str) -> PendingTarget {
+    let normalized = normalize_pending_target_text(text);
+    if normalized.is_empty() {
+        return PendingTarget::Implicit;
+    }
+
+    if normalized.eq_ignore_ascii_case("last")
+        || normalized.eq_ignore_ascii_case("latest")
+    {
+        return PendingTarget::Last;
+    }
+
+    if let Ok(index) = normalized.parse::<usize>() {
+        if index > 0 {
+            return PendingTarget::Ordinal(index);
+        }
+    }
+
+    if let Some(index) = parse_chinese_ordinal(normalized) {
+        return PendingTarget::Ordinal(index);
+    }
+
+    PendingTarget::Token(normalized.to_owned())
+}
+
+fn normalize_pending_target_text(text: &str) -> &str {
+    text.trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | ')' | ',' | ':' | ';'))
+        .trim()
+}
+
+fn parse_chinese_ordinal(text: &str) -> Option<usize> {
+    let candidate = text
+        .strip_prefix('\u{7b2c}')
+        .unwrap_or(text)
+        .strip_suffix("\u{9879}")
+        .or_else(|| {
+            text.strip_prefix('\u{7b2c}')
+                .unwrap_or(text)
+                .strip_suffix('\u{4e2a}')
+        })
+        .or_else(|| {
+            text.strip_prefix('\u{7b2c}')
+                .unwrap_or(text)
+                .strip_suffix('\u{6761}')
+        })
+        .or_else(|| {
+            text.strip_prefix('\u{7b2c}')
+                .unwrap_or(text)
+                .strip_suffix('\u{9898}')
+        })
+        .unwrap_or(text.strip_prefix('\u{7b2c}').unwrap_or(text));
+
+    if let Ok(index) = candidate.parse::<usize>() {
+        return (index > 0).then_some(index);
+    }
+
+    parse_simple_chinese_number(candidate)
+}
+
+fn parse_simple_chinese_number(text: &str) -> Option<usize> {
+    if text.is_empty() {
+        return None;
+    }
+    if text == "\u{5341}" {
+        return Some(10);
+    }
+    if let Some(ones) = text.strip_prefix('\u{5341}') {
+        return chinese_digit_value(ones).map(|ones| 10 + ones);
+    }
+    if let Some(tens) = text.strip_suffix('\u{5341}') {
+        return chinese_digit_value(tens).map(|tens| tens * 10);
+    }
+    if let Some((tens, ones)) = text.split_once('\u{5341}') {
+        return Some(chinese_digit_value(tens)? * 10 + chinese_digit_value(ones)?);
+    }
+    chinese_digit_value(text)
+}
+
+fn chinese_digit_value(text: &str) -> Option<usize> {
+    match text {
+        "\u{4e00}" => Some(1),
+        "\u{4e8c}" | "\u{4e24}" => Some(2),
+        "\u{4e09}" => Some(3),
+        "\u{56db}" => Some(4),
+        "\u{4e94}" => Some(5),
+        "\u{516d}" => Some(6),
+        "\u{4e03}" => Some(7),
+        "\u{516b}" => Some(8),
+        "\u{4e5d}" => Some(9),
+        _ => None,
+    }
+}
+fn resolve_pending_target<'a>(
+    pending: &'a [PendingInteractionSummary],
+    target: &PendingTarget,
+) -> Result<&'a PendingInteractionSummary> {
+    if pending.is_empty() {
+        return Err(anyhow!(
+            "No pending Codex approvals or questions for the current thread."
+        ));
+    }
+
+    match target {
+        PendingTarget::Implicit => {
+            if pending.len() == 1 {
+                Ok(&pending[0])
+            } else {
+                Err(anyhow!(
+                    "There are {} pending Codex requests right now.\n\n{}",
+                    pending.len(),
+                    format_pending_list(pending)
+                ))
+            }
+        }
+        PendingTarget::Ordinal(index) => pending.get(index - 1).ok_or_else(|| {
+            anyhow!(
+                "Pending request #{index} does not exist.\n\n{}",
+                format_pending_list(pending)
+            )
+        }),
+        PendingTarget::Token(token) => pending
+            .iter()
+            .find(|summary| summary.token == *token)
+            .ok_or_else(|| {
+                anyhow!(
+                    "No pending Codex request matches token `{token}`.\n\n{}",
+                    format_pending_list(pending)
+                )
+            }),
+        PendingTarget::Last => pending.last().ok_or_else(|| {
+            anyhow!("No pending Codex approvals or questions for the current thread.")
+        }),
+    }
+}
+
+fn format_pending_list(pending: &[PendingInteractionSummary]) -> String {
+    if pending.is_empty() {
+        return "No pending Codex approvals or questions for the current thread.".to_owned();
+    }
+
+    let mut blocks = vec![
+        "Pending Codex requests:".to_owned(),
+        "Use `/approve`, `/deny`, `/cancel`, or `/reply` directly when there is only one pending request. Otherwise use the item number shown below.".to_owned(),
+    ];
+    for (index, summary) in pending.iter().enumerate() {
+        let body = format!(
+            "{}\n{}",
+            pending_summary_heading(summary),
+            summary.prompt
+        );
+        blocks.push(prefix_block(&format!("{}. ", index + 1), &body));
+    }
+    blocks.join("\n\n")
+}
+
+fn pending_summary_heading(summary: &PendingInteractionSummary) -> String {
+    match &summary.kind {
+        crate::model::PendingInteractionKind::CommandApproval { .. } => {
+            format!("Command approval (`{}`)", summary.token)
+        }
+        crate::model::PendingInteractionKind::FileChangeApproval => {
+            format!("File-change approval (`{}`)", summary.token)
+        }
+        crate::model::PendingInteractionKind::PermissionsApproval { .. } => {
+            format!("Additional permissions (`{}`)", summary.token)
+        }
+        crate::model::PendingInteractionKind::UserInputRequest { questions } => {
+            format!("User input request (`{}`) | {} question(s)", summary.token, questions.len())
+        }
+    }
+}
+
+fn prefix_block(prefix: &str, block: &str) -> String {
+    let mut lines = block.lines();
+    let Some(first_line) = lines.next() else {
+        return prefix.trim_end().to_owned();
+    };
+
+    let mut output = format!("{prefix}{first_line}");
+    let padding = " ".repeat(prefix.chars().count());
+    for line in lines {
+        output.push('\n');
+        output.push_str(&padding);
+        output.push_str(line);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_interaction_command, parse_management_command, parse_pending_target,
+        resolve_pending_target, InteractionCommand, ManagementCommand, PendingTarget,
+    };
+    use crate::model::{
+        CollaborationModePreset, PendingInteractionKind, PendingInteractionSummary,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn parses_implicit_approval_command() {
+        let command = parse_interaction_command("/approve").expect("command");
+        assert!(matches!(
+            command,
+            InteractionCommand::Approve(PendingTarget::Implicit)
+        ));
+    }
+
+    #[test]
+    fn parses_ordinal_targets() {
+        assert_eq!(parse_pending_target("1"), PendingTarget::Ordinal(1));
+        assert_eq!(
+            parse_pending_target("\u{7b2c}\u{4e8c}\u{9879}"),
+            PendingTarget::Ordinal(2)
+        );
+        assert_eq!(
+            parse_pending_target("\u{7b2c}\u{4e09}\u{4e2a}"),
+            PendingTarget::Ordinal(3)
+        );
+        assert_eq!(parse_pending_target("last"), PendingTarget::Last);
+    }
+
+    #[test]
+    fn reply_without_target_stays_implicit() {
+        let command = parse_interaction_command("/reply 2").expect("command");
+        assert!(matches!(
+            command,
+            InteractionCommand::ReplyText {
+                target: PendingTarget::Implicit,
+                text,
+            } if text == "2"
+        ));
+    }
+
+    #[test]
+    fn reply_with_target_and_answer_uses_ordinal_target() {
+        let command = parse_interaction_command(
+            "/reply \u{7b2c}\u{4e8c}\u{9879} \u{6211}\u{9009}\u{7b2c}\u{4e8c}\u{4e2a}",
+        )
+        .expect("command");
+        assert!(matches!(
+            command,
+            InteractionCommand::ReplyText {
+                target: PendingTarget::Ordinal(2),
+                text,
+            } if text == "\u{6211}\u{9009}\u{7b2c}\u{4e8c}\u{4e2a}"
+        ));
+    }
+
+    #[test]
+    fn resolve_implicit_target_requires_single_pending_item() {
+        let pending = vec![
+            sample_pending("req-1"),
+            sample_pending("req-2"),
+        ];
+        let err = resolve_pending_target(&pending, &PendingTarget::Implicit).expect_err("should fail");
+        assert!(err.to_string().contains("There are 2 pending Codex requests"));
+    }
+
+    #[test]
+    fn reply_with_plain_text_sentence_keeps_whole_answer() {
+        let command =
+            parse_interaction_command("/reply my custom answer").expect("command");
+        assert!(matches!(
+            command,
+            InteractionCommand::ReplyText {
+                target: PendingTarget::Implicit,
+                text,
+            } if text == "my custom answer"
+        ));
+    }
+
+    #[test]
+    fn reply_with_req_token_keeps_explicit_target() {
+        let command =
+            parse_interaction_command("/reply req-3 my custom answer").expect("command");
+        assert!(matches!(
+            command,
+            InteractionCommand::ReplyText {
+                target: PendingTarget::Token(token),
+                text,
+            } if token == "req-3" && text == "my custom answer"
+        ));
+    }
+
+    #[test]
+    fn resolve_last_target_returns_most_recent_item() {
+        let pending = vec![
+            sample_pending("req-1"),
+            sample_pending("req-2"),
+        ];
+        let summary = resolve_pending_target(&pending, &PendingTarget::Last).expect("summary");
+        assert_eq!(summary.token, "req-2");
+    }
+
+    #[test]
+    fn parses_mode_query_management_command() {
+        assert!(matches!(
+            parse_management_command("/mode"),
+            Some(ManagementCommand::ShowMode)
+        ));
+    }
+
+    #[test]
+    fn parses_mode_plan_management_command() {
+        assert!(matches!(
+            parse_management_command("/mode plan"),
+            Some(ManagementCommand::SetMode(CollaborationModePreset::Plan))
+        ));
+    }
+
+    #[test]
+    fn parses_reply_other_command() {
+        assert!(matches!(
+            parse_interaction_command("/reply-other"),
+            Some(InteractionCommand::ReplyOther(PendingTarget::Implicit))
+        ));
+    }
+
+    fn sample_pending(token: &str) -> PendingInteractionSummary {
+        PendingInteractionSummary {
+            token: token.to_owned(),
+            kind: PendingInteractionKind::UserInputRequest {
+                questions: vec![json!({
+                    "id": "choice",
+                    "header": "Pick",
+                    "question": "Choose one option",
+                    "options": [
+                        { "label": "One" },
+                        { "label": "Two" }
+                    ]
+                })],
+            },
+            prompt: format!("Codex requests user input (`{token}`)."),
+        }
+    }
 }
 
 fn ensure_state_is_usable(state: &mut ConversationState, default_working_directory: &Path) {
@@ -560,16 +1313,25 @@ fn format_threads_message(
                 .as_deref()
                 .map(short_session_id)
                 .unwrap_or("new");
+            let mode = describe_thread_mode(thread);
             lines.push(format!(
-                "{marker} `{}` | cwd=`{}` | session={session}",
+                "{marker} `{}` | cwd=`{}` | mode={mode} | session={session}",
                 thread.alias,
                 working_directory.display()
             ));
         }
     }
 
-    lines.push("Commands: `/threads`, `/thread new <name>`, `/thread use <name>`, `/cd <path>`, `/pwd`".to_owned());
+    lines.push("Commands: `/threads`, `/thread new <name>`, `/thread use <name>`, `/cd <path>`, `/pwd`, `/mode`, `/mode plan`, `/mode default`".to_owned());
     lines.join("\n")
+}
+
+fn describe_thread_mode(thread: &ThreadRecord) -> &'static str {
+    thread
+        .collaboration_mode
+        .as_ref()
+        .map(CollaborationModePreset::display_name)
+        .unwrap_or("codex-default")
 }
 
 fn short_session_id(session_id: &str) -> &str {
@@ -592,6 +1354,8 @@ async fn forward_codex_event(
                     text,
                     is_partial,
                     kind: OutboundMessageKind::Agent,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
                 })
                 .await?;
         }
@@ -603,6 +1367,21 @@ async fn forward_codex_event(
                     text: format_notice_message(&message),
                     is_partial: false,
                     kind: OutboundMessageKind::Notice,
+                    pending_interaction: None,
+                    dismiss_pending_token: None,
+                })
+                .await?;
+        }
+        CodexStreamEvent::PendingInteraction(summary) => {
+            adapter
+                .send(OutboundMessage {
+                    adapter: adapter_name,
+                    conversation_id,
+                    text: summary.prompt.clone(),
+                    is_partial: false,
+                    kind: OutboundMessageKind::PendingInteraction,
+                    pending_interaction: Some(summary),
+                    dismiss_pending_token: None,
                 })
                 .await?;
         }
@@ -626,6 +1405,7 @@ async fn run_turn_once(
     session_id: Option<String>,
     prompt: String,
     working_directory: PathBuf,
+    collaboration_mode: Option<CollaborationModePreset>,
     adapter: Arc<dyn ImAdapter>,
     adapter_name: String,
     conversation_id: String,
@@ -636,6 +1416,7 @@ async fn run_turn_once(
                 session_id,
                 prompt,
                 working_directory,
+                collaboration_mode,
             },
             move |event| {
                 let adapter = adapter.clone();

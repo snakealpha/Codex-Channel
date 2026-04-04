@@ -1,4 +1,5 @@
 mod codex;
+mod codex_app_server;
 mod config;
 mod gateway;
 mod im;

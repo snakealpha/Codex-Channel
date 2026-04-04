@@ -72,6 +72,16 @@ pub struct CodexConfig {
     pub launcher: Vec<String>,
     pub working_directory: PathBuf,
     #[serde(default)]
+    pub use_app_server: bool,
+    #[serde(default = "default_app_server_url")]
+    pub app_server_url: String,
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub ask_for_approval: Option<String>,
+    #[serde(default)]
+    pub search: bool,
+    #[serde(default)]
     pub http_proxy: Option<String>,
     #[serde(default)]
     pub https_proxy: Option<String>,
@@ -137,6 +147,10 @@ fn default_console_banner() -> String {
 
 fn default_turn_timeout_secs() -> u64 {
     90
+}
+
+fn default_app_server_url() -> String {
+    "ws://127.0.0.1:8765".to_owned()
 }
 
 #[cfg(target_os = "windows")]

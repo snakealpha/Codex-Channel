@@ -11,8 +11,21 @@ Use `/quit` to stop.
 """
 
 [codex]
+launcher = ["codex"]
 working_directory = ".."
-skip_git_repo_check = false
+use_app_server = true
+app_server_url = "ws://127.0.0.1:8765"
+sandbox = "workspace-write"
+ask_for_approval = "on-request"
+search = false
+http_proxy = ""
+https_proxy = ""
+all_proxy = ""
+no_proxy = ""
+model = "gpt-5.4"
+profile = ""
+skip_git_repo_check = true
 full_auto = false
+turn_timeout_secs = 90
 additional_writable_dirs = []
 extra_args = []

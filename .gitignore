@@ -1,3 +1,6 @@
 /target
+/target-hotfix
 .tmp/
+/config/.codex-channel/
+/feishu-debug.log
 config/feishu.local.toml

@@ -1,4 +1,4 @@
-state_file = ".codex-channel/sessions.json"
+state_file = "/Users/your-name/.codex-channel/sessions.json"
 
 [adapter]
 type = "feishu"
@@ -8,8 +8,8 @@ base_url = "https://open.feishu.cn"
 reconnect_interval_secs = 5
 
 [codex]
-launcher = ["codex"]
-working_directory = ".."
+launcher = ["/Users/your-name/.cargo/bin/codex"]
+working_directory = "/Users/your-name/workspaces/openclaw"
 use_app_server = true
 app_server_url = "ws://127.0.0.1:8765"
 sandbox = "workspace-write"
@@ -18,11 +18,14 @@ search = false
 http_proxy = "http://127.0.0.1:7890"
 https_proxy = "http://127.0.0.1:7890"
 all_proxy = ""
-no_proxy = ""
+no_proxy = "127.0.0.1,localhost"
 model = "gpt-5.4"
 profile = ""
 skip_git_repo_check = true
 full_auto = false
 turn_timeout_secs = 90
-additional_writable_dirs = []
+additional_writable_dirs = [
+  "/Users/your-name/workspaces/other-repo",
+  "/Users/your-name/data",
+]
 extra_args = []

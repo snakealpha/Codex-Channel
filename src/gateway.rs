@@ -9,19 +9,19 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
-use crate::codex::{
-    CodexCli, CodexRequest, CodexStreamEvent, CodexTurnSummary, PendingInteractionAction,
-};
-use crate::im::ImAdapter;
+use crate::backend::traits::AgentBackend;
+use crate::frontend::traits::ChannelFrontend;
 use crate::model::{
-    conversation_key, CollaborationModePreset, ConversationState, InboundMessage, OutboundMessage,
-    OutboundMessageKind, PendingInteractionKind, PendingInteractionSummary, ThreadRecord,
+    conversation_key, AgentRequest, AgentStreamEvent, AgentTurnSummary,
+    CollaborationModePreset, ConversationState, InboundMessage, OutboundMessage,
+    OutboundMessageKind, PendingInteractionAction, PendingInteractionKind,
+    PendingInteractionSummary, ThreadRecord,
 };
 use crate::session_store::SessionStore;
 
 pub struct Gateway {
-    adapter: Arc<dyn ImAdapter>,
-    codex: Arc<CodexCli>,
+    adapter: Arc<dyn ChannelFrontend>,
+    codex: Arc<dyn AgentBackend>,
     session_store: Arc<SessionStore>,
     default_working_directory: PathBuf,
     conversation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -31,8 +31,8 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(
-        adapter: Arc<dyn ImAdapter>,
-        codex: Arc<CodexCli>,
+        adapter: Arc<dyn ChannelFrontend>,
+        codex: Arc<dyn AgentBackend>,
         session_store: Arc<SessionStore>,
         default_working_directory: PathBuf,
     ) -> Self {
@@ -1687,14 +1687,14 @@ fn short_session_id(session_id: &str) -> &str {
     &session_id[..end]
 }
 
-async fn forward_codex_event(
-    adapter: Arc<dyn ImAdapter>,
+async fn forward_agent_event(
+    adapter: Arc<dyn ChannelFrontend>,
     adapter_name: String,
     conversation_id: String,
-    event: CodexStreamEvent,
+    event: AgentStreamEvent,
 ) -> Result<()> {
     match event {
-        CodexStreamEvent::AgentMessage { text, is_partial } => {
+        AgentStreamEvent::AgentMessage { text, is_partial } => {
             adapter
                 .send(OutboundMessage {
                     adapter: adapter_name,
@@ -1707,7 +1707,7 @@ async fn forward_codex_event(
                 })
                 .await?;
         }
-        CodexStreamEvent::Notice(message) => {
+        AgentStreamEvent::Notice(message) => {
             adapter
                 .send(OutboundMessage {
                     adapter: adapter_name,
@@ -1720,7 +1720,7 @@ async fn forward_codex_event(
                 })
                 .await?;
         }
-        CodexStreamEvent::PendingInteraction(summary) => {
+        AgentStreamEvent::PendingInteraction(summary) => {
             adapter
                 .send(OutboundMessage {
                     adapter: adapter_name,
@@ -1749,31 +1749,37 @@ fn should_retry_with_fresh_session(existing_session: Option<&String>, err: &anyh
 }
 
 async fn run_turn_once(
-    codex: Arc<CodexCli>,
+    codex: Arc<dyn AgentBackend>,
     session_id: Option<String>,
     prompt: String,
     working_directory: PathBuf,
     collaboration_mode: Option<CollaborationModePreset>,
-    adapter: Arc<dyn ImAdapter>,
+    adapter: Arc<dyn ChannelFrontend>,
     adapter_name: String,
     conversation_id: String,
-) -> Result<CodexTurnSummary> {
-    codex
-        .run_turn(
-            CodexRequest {
-                session_id,
-                prompt,
-                working_directory,
-                collaboration_mode,
-            },
-            move |event| {
-                let adapter = adapter.clone();
-                let adapter_name = adapter_name.clone();
-                let conversation_id = conversation_id.clone();
-                async move { forward_codex_event(adapter, adapter_name, conversation_id, event).await }
-            },
+) -> Result<AgentTurnSummary> {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let backend = codex.clone();
+    let request = AgentRequest {
+        session_id,
+        prompt,
+        working_directory,
+        collaboration_mode,
+    };
+
+    let turn_task = tokio::spawn(async move { backend.run_turn(request, event_tx).await });
+
+    while let Some(event) = event_rx.recv().await {
+        forward_agent_event(
+            adapter.clone(),
+            adapter_name.clone(),
+            conversation_id.clone(),
+            event,
         )
-        .await
+        .await?;
+    }
+
+    turn_task.await?
 }
 
 fn format_notice_message(message: &str) -> String {

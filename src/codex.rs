@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 
 use crate::codex_app_server::AppServerClient;
 use crate::config::CodexConfig;
+pub use crate::domain::interaction::PendingInteractionAction;
 use crate::model::{CollaborationModePreset, PendingInteractionSummary};
 
 #[derive(Debug, Clone)]
@@ -31,16 +32,6 @@ pub enum CodexStreamEvent {
     AgentMessage { text: String, is_partial: bool },
     Notice(String),
     PendingInteraction(PendingInteractionSummary),
-}
-
-#[derive(Debug, Clone)]
-pub enum PendingInteractionAction {
-    Approve,
-    ApproveForSession,
-    Deny,
-    Cancel,
-    ReplyText(String),
-    ReplyJson(Value),
 }
 
 pub struct CodexCli {

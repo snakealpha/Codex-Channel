@@ -1,7 +1,10 @@
 mod codex;
 mod codex_app_server;
 mod config;
+mod backend;
+mod domain;
 mod gateway;
+mod frontend;
 mod im;
 mod model;
 mod session_store;
@@ -10,9 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use backend::traits::AgentBackend;
 use config::GatewayConfig;
+use frontend::traits::ChannelFrontend;
 use gateway::Gateway;
-use im::build_adapter;
 use session_store::SessionStore;
 use tracing_subscriber::EnvFilter;
 
@@ -61,11 +65,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse()?;
     let config = GatewayConfig::load(&cli.config).await?;
     let default_working_directory = config.codex.working_directory.clone();
-    let adapter = build_adapter(&config.adapter)?;
+    let frontend: Arc<dyn ChannelFrontend> = frontend::build_frontend(&config.adapter)?;
     let codex = Arc::new(codex::CodexCli::new(config.codex.clone()));
+    let backend: Arc<dyn AgentBackend> = if config.codex.use_app_server {
+        Arc::new(backend::codex::CodexAppServerBackend::new(codex))
+    } else {
+        Arc::new(backend::codex::CodexExecBackend::new(codex))
+    };
     let session_store = Arc::new(SessionStore::load(config.state_file.clone()).await?);
 
-    Gateway::new(adapter, codex, session_store, default_working_directory)
+    Gateway::new(frontend, backend, session_store, default_working_directory)
         .run()
         .await
 }

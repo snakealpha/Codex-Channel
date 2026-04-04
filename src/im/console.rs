@@ -4,7 +4,7 @@ use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::config::ConsoleAdapterConfig;
-use crate::im::ImAdapter;
+use crate::frontend::traits::ChannelFrontend;
 use crate::model::{InboundMessage, OutboundMessage, OutboundMessageKind};
 
 pub struct ConsoleAdapter {
@@ -42,7 +42,7 @@ impl ConsoleAdapter {
 }
 
 #[async_trait]
-impl ImAdapter for ConsoleAdapter {
+impl ChannelFrontend for ConsoleAdapter {
     fn name(&self) -> &'static str {
         "console"
     }

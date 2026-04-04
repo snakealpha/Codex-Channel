@@ -10,7 +10,6 @@ use reqwest::Client;
 use reqwest::Url;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -21,7 +20,13 @@ use tokio_tungstenite::{client_async_tls, connect_async};
 use tracing::{debug, error, info, warn};
 
 use crate::config::FeishuAdapterConfig;
-use crate::im::ImAdapter;
+use crate::frontend::feishu::parsing::extract_inbound_text;
+use crate::frontend::feishu::rendering::{
+    build_notice_post, coded_option_button_label, coded_option_label,
+    looks_like_markdown_notice_post, render_coded_options,
+};
+use crate::frontend::feishu::transport::extract_service_id;
+use crate::frontend::traits::ChannelFrontend;
 use crate::model::{
     InboundMessage, OutboundMessage, OutboundMessageKind, PendingInteractionKind,
     PendingInteractionSummary,
@@ -855,7 +860,7 @@ impl FeishuAdapter {
 }
 
 #[async_trait]
-impl ImAdapter for FeishuAdapter {
+impl ChannelFrontend for FeishuAdapter {
     fn name(&self) -> &'static str {
         "feishu"
     }
@@ -1108,102 +1113,6 @@ fn build_pending_interaction_card(
         },
         "elements": elements,
     })
-}
-
-fn build_notice_post(text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "zh_cn": {
-            "title": "",
-            "content": build_notice_post_content_rows(text),
-        }
-    })
-}
-
-fn build_notice_post_content_rows(text: &str) -> Vec<serde_json::Value> {
-    parse_notice_blocks(text)
-        .into_iter()
-        .filter_map(|block| match block {
-            NoticeBlock::Text(text) => {
-                let text = text.trim();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!([
-                        {
-                            "tag": "text",
-                            "text": text,
-                            "style": [],
-                        }
-                    ]))
-                }
-            }
-            NoticeBlock::Code(code) => {
-                let code = code.trim_end_matches('\n');
-                if code.trim().is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!([
-                        {
-                            "tag": "code_block",
-                            "language": "PLAIN_TEXT",
-                            "text": format!("{code}\n"),
-                        }
-                    ]))
-                }
-            }
-        })
-        .collect()
-}
-
-fn parse_notice_blocks(text: &str) -> Vec<NoticeBlock> {
-    let mut blocks = Vec::new();
-    let mut buffer = String::new();
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            if in_code_block {
-                if !buffer.is_empty() {
-                    blocks.push(NoticeBlock::Code(std::mem::take(&mut buffer)));
-                }
-                in_code_block = false;
-            } else {
-                if !buffer.trim().is_empty() {
-                    blocks.extend(
-                        buffer
-                            .split("\n\n")
-                            .map(str::trim)
-                            .filter(|segment| !segment.is_empty())
-                            .map(|segment| NoticeBlock::Text(segment.to_owned())),
-                    );
-                }
-                buffer.clear();
-                in_code_block = true;
-            }
-            continue;
-        }
-
-        if !buffer.is_empty() {
-            buffer.push('\n');
-        }
-        buffer.push_str(line);
-    }
-
-    if in_code_block {
-        if !buffer.is_empty() {
-            blocks.push(NoticeBlock::Code(buffer));
-        }
-    } else if !buffer.trim().is_empty() {
-        blocks.extend(
-            buffer
-                .split("\n\n")
-                .map(str::trim)
-                .filter(|segment| !segment.is_empty())
-                .map(|segment| NoticeBlock::Text(segment.to_owned())),
-        );
-    }
-
-    blocks
 }
 
 fn build_notice_card(text: &str) -> serde_json::Value {
@@ -1832,64 +1741,6 @@ fn pending_card_action_key(token: &str, question_id: Option<&str>) -> String {
     }
 }
 
-fn looks_like_markdown_notice_post(text: &str) -> bool {
-    text.contains("```")
-}
-
-enum NoticeBlock {
-    Text(String),
-    Code(String),
-}
-
-fn render_coded_options(options: &[serde_json::Value]) -> Vec<String> {
-    options
-        .iter()
-        .enumerate()
-        .filter_map(|(index, option)| {
-            option
-                .get("label")
-                .and_then(serde_json::Value::as_str)
-                .map(|label| format!("{}：{label}", coded_option_label(index)))
-        })
-        .collect()
-}
-
-fn coded_option_button_label(index: usize) -> String {
-    if index == 0 {
-        format!("{}（Recommand）", coded_option_label(index))
-    } else {
-        coded_option_label(index)
-    }
-}
-
-fn coded_option_label(index: usize) -> String {
-    format!("选项{}", option_code(index))
-}
-
-fn option_code(mut index: usize) -> String {
-    let mut chars = Vec::new();
-    loop {
-        let remainder = index % 26;
-        chars.push((b'A' + remainder as u8) as char);
-        if index < 26 {
-            break;
-        }
-        index = index / 26 - 1;
-    }
-    chars.iter().rev().collect()
-}
-
-fn extract_service_id(url: &str) -> Option<i32> {
-    let (_, query) = url.split_once('?')?;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        if key == "service_id" {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 fn build_ping_frame(service_id: i32) -> Vec<u8> {
     let frame = FeishuFrame {
         seq_id: 0,
@@ -2046,69 +1897,7 @@ impl EventMessage {
         let Some(content) = self.content.as_ref() else {
             return Ok(None);
         };
-        match self.message_type.as_deref() {
-            Some("text") | None => {
-                let content: TextContent = serde_json::from_str(content)
-                    .context("failed to decode feishu text content json")?;
-                Ok(content.text.filter(|text| !text.trim().is_empty()))
-            }
-            Some("post") => extract_post_text(content),
-            Some(_) => extract_generic_text(content),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct TextContent {
-    text: Option<String>,
-}
-
-fn extract_post_text(content: &str) -> Result<Option<String>> {
-    let value: Value =
-        serde_json::from_str(content).context("failed to decode feishu post content json")?;
-    Ok(collect_text_fragments(&value)
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty()))
-}
-
-fn extract_generic_text(content: &str) -> Result<Option<String>> {
-    let value: Value =
-        serde_json::from_str(content).context("failed to decode feishu message content json")?;
-    Ok(collect_text_fragments(&value)
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty()))
-}
-
-fn collect_text_fragments(value: &Value) -> Option<String> {
-    let mut fragments = Vec::new();
-    collect_text_fragments_into(value, &mut fragments);
-    let joined = fragments
-        .into_iter()
-        .filter(|fragment| !fragment.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!joined.trim().is_empty()).then_some(joined)
-}
-
-fn collect_text_fragments_into(value: &Value, fragments: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(Value::as_str) {
-                fragments.push(text.to_owned());
-            }
-            if let Some(title) = map.get("title").and_then(Value::as_str) {
-                fragments.push(title.to_owned());
-            }
-            for child in map.values() {
-                collect_text_fragments_into(child, fragments);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                collect_text_fragments_into(child, fragments);
-            }
-        }
-        _ => {}
+        extract_inbound_text(self.message_type.as_deref(), content)
     }
 }
 

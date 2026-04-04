@@ -4,3 +4,6 @@
 /config/.codex-channel/
 /feishu-debug.log
 config/feishu.local.toml
+target-hotfix/debug/.fingerprint
+target-hotfix
+feishu-debug.log

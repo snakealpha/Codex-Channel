@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use serde_json::{json, Map, Value};
+use toml::Value as TomlValue;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -22,7 +23,6 @@ use crate::codex::{
 use crate::config::CodexConfig;
 use crate::model::{CollaborationModePreset, PendingInteractionKind, PendingInteractionSummary};
 
-const APP_SERVER_SESSION_SOURCE: &str = "appServer";
 const APP_SERVER_INIT_TIMEOUT_SECS: u64 = 15;
 const APP_SERVER_RPC_TIMEOUT_SECS: u64 = 30;
 
@@ -67,6 +67,7 @@ impl AppServerClient {
             .start_turn(
                 &thread_id,
                 &request.prompt,
+                &request.working_directory,
                 request.collaboration_mode.as_ref(),
             )
             .await
@@ -299,7 +300,7 @@ impl AppServerConnection {
     }
 
     async fn start_thread(&self, working_directory: &std::path::Path) -> Result<String> {
-        let params = json!({
+        let mut params = json!({
             "cwd": working_directory.display().to_string(),
             "approvalPolicy": self.json_approval_policy_value(),
             "approvalsReviewer": "user",
@@ -307,6 +308,10 @@ impl AppServerConnection {
             "experimentalRawEvents": false,
             "persistExtendedHistory": true,
         });
+
+        if let Some(model) = &self.config.model {
+            params["model"] = json!(model);
+        }
 
         let result = self.call("thread/start", params).await?;
         extract_thread_id(&result)
@@ -317,7 +322,7 @@ impl AppServerConnection {
         thread_id: &str,
         working_directory: &std::path::Path,
     ) -> Result<String> {
-        let params = json!({
+        let mut params = json!({
             "threadId": thread_id,
             "cwd": working_directory.display().to_string(),
             "approvalPolicy": self.json_approval_policy_value(),
@@ -325,6 +330,10 @@ impl AppServerConnection {
             "sandbox": self.json_sandbox_mode_value(),
             "persistExtendedHistory": true,
         });
+
+        if let Some(model) = &self.config.model {
+            params["model"] = json!(model);
+        }
 
         let result = self.call("thread/resume", params).await?;
         extract_thread_id(&result)
@@ -334,10 +343,12 @@ impl AppServerConnection {
         &self,
         thread_id: &str,
         prompt: &str,
+        working_directory: &std::path::Path,
         collaboration_mode: Option<&CollaborationModePreset>,
     ) -> Result<()> {
         let mut params = json!({
             "threadId": thread_id,
+            "cwd": working_directory.display().to_string(),
             "input": [
                 {
                     "type": "text",
@@ -348,6 +359,14 @@ impl AppServerConnection {
             "approvalPolicy": self.json_approval_policy_value(),
             "approvalsReviewer": "user",
         });
+
+        if let Some(model) = &self.config.model {
+            params["model"] = json!(model);
+        }
+
+        if let Some(sandbox_policy) = self.json_sandbox_policy_value() {
+            params["sandboxPolicy"] = sandbox_policy;
+        }
 
         if let Some(mode) = collaboration_mode {
             params["collaborationMode"] = self.json_collaboration_mode_value(mode);
@@ -714,6 +733,27 @@ impl AppServerConnection {
         }
     }
 
+    fn json_sandbox_policy_value(&self) -> Option<Value> {
+        match self.config.sandbox.as_deref() {
+            Some("danger-full-access") => Some(json!({
+                "type": "dangerFullAccess"
+            })),
+            Some("read-only") => Some(json!({
+                "type": "readOnly"
+            })),
+            Some("workspace-write") | None => Some(json!({
+                "type": "workspaceWrite",
+                "writableRoots": self
+                    .config
+                    .additional_writable_dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+            })),
+            Some(_) => None,
+        }
+    }
+
     fn json_collaboration_mode_value(&self, mode: &CollaborationModePreset) -> Value {
         let model = self
             .config
@@ -746,14 +786,51 @@ fn build_app_server_command(config: &CodexConfig, listen_url: &str) -> Result<Co
     command.current_dir(&config.working_directory);
     apply_proxy_environment(&mut command, config);
     command.arg("app-server");
+    apply_app_server_config_overrides(&mut command, config);
     command.arg("--listen");
     command.arg(listen_url);
-    command.arg("--session-source");
-    command.arg(APP_SERVER_SESSION_SOURCE);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     Ok(command)
+}
+
+fn apply_app_server_config_overrides(command: &mut Command, config: &CodexConfig) {
+    if let Some(model) = &config.model {
+        append_config_override(command, "model", TomlValue::String(model.clone()));
+    }
+
+    if let Some(profile) = &config.profile {
+        if !profile.trim().is_empty() {
+            append_config_override(command, "profile", TomlValue::String(profile.clone()));
+        }
+    }
+
+    let web_search_mode = if config.search { "live" } else { "disabled" };
+    append_config_override(
+        command,
+        "web_search",
+        TomlValue::String(web_search_mode.to_owned()),
+    );
+
+    if matches!(config.sandbox.as_deref(), Some("workspace-write") | None) {
+        append_config_override(
+            command,
+            "sandbox_workspace_write.writable_roots",
+            TomlValue::Array(
+                config
+                    .additional_writable_dirs
+                    .iter()
+                    .map(|dir| TomlValue::String(dir.display().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn append_config_override(command: &mut Command, key: &str, value: TomlValue) {
+    command.arg("-c");
+    command.arg(format!("{key}={value}"));
 }
 
 fn resolve_listen_url(configured_url: &str) -> Result<String> {
